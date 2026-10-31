@@ -1,0 +1,82 @@
+{
+  "when": "2026-10-31T12:47:32-0700",
+  "note": "tally serve --workers 4 (Python 3.13.15, native), TALLY_MAINTENANCE_INTERVAL unset (default 5), TALLY_POOL_SIZE=20 (default), API as the runtime role; PostgreSQL 17.11 (postgres:17-alpine) in Docker Desktop 29.8.2 (VM: 10 CPUs, 7.7 GiB); Apple M5 (Mac17,2, 10 cores, 24 GB), macOS 27.0.1; load generator on the same machine",
+  "base_url": "http://127.0.0.1:8012",
+  "wallets": 200,
+  "deposit": 10000,
+  "client_python": "3.13.15",
+  "scenarios": [
+    {
+      "scenario": "spread",
+      "requests": 5000,
+      "concurrency": 100,
+      "seconds": 2.272,
+      "accepted": 5000,
+      "accepted_per_second": 2200.9,
+      "latency_ms": {
+        "p50": 43.2,
+        "p95": 81.9,
+        "p99": 119.8
+      },
+      "outcomes": {
+        "ok": 5000
+      },
+      "paid": 1268505,
+      "completed": 5000,
+      "completed_per_second": 2200.9,
+      "lock_wait_mean_ms": 9.2
+    },
+    {
+      "scenario": "hotspot",
+      "requests": 5000,
+      "concurrency": 100,
+      "seconds": 8.809,
+      "accepted": 5000,
+      "accepted_per_second": 567.6,
+      "latency_ms": {
+        "p50": 41.1,
+        "p95": 1072.0,
+        "p99": 1846.0
+      },
+      "outcomes": {
+        "ok": 5000
+      },
+      "paid": 128277,
+      "completed": 5000,
+      "completed_per_second": 567.6,
+      "lock_wait_mean_ms": 136.9
+    },
+    {
+      "scenario": "hotspot, batched",
+      "requests": 5000,
+      "concurrency": 100,
+      "seconds": 2.007,
+      "accepted": 5000,
+      "accepted_per_second": 2491.1,
+      "latency_ms": {
+        "p50": 38.5,
+        "p95": 58.1,
+        "p99": 73.8
+      },
+      "outcomes": {
+        "ok": 5000
+      },
+      "paid": 127528,
+      "lock_wait_mean_ms": 3.7,
+      "holds": {
+        "captured": 5000,
+        "voided": 0,
+        "expired": 0,
+        "active": 0
+      },
+      "not_accepted": 0,
+      "completed": 5000,
+      "end_to_end_seconds": 4.521,
+      "completed_per_second": 1106.0,
+      "settled_after_last_accepted_seconds": 2.513
+    }
+  ],
+  "reconciliation_ok": true,
+  "money_conserved": true,
+  "unexpected": {}
+}

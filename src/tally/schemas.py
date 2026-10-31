@@ -133,10 +133,10 @@ class HoldOut(BaseModel):
     amount: int
     status: Literal["active", "captured", "voided", "expired"]
     description: str
-    expires_at: datetime | None = Field(description="None for payments: they don't expire")
+    expires_at: datetime | None = Field(description="null for payments: they don't expire")
     captured_transaction_id: UUID | None
     settle_to_account_id: int | None
-    void_reason: str | None = Field(description="Why settlement voided a payment; None otherwise")
+    void_reason: str | None = Field(description="Why settlement voided a payment; null otherwise")
     created_at: datetime
     updated_at: datetime
 
