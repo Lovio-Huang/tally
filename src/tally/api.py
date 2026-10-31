@@ -49,6 +49,7 @@ from .ledger import EXPIRY_BATCH_SIZE, SETTLE_BATCH_SIZE, Ledger, Leg
 from .observability import PROBLEMS, RequestContext, configure_logging, metrics_text, request_id
 from .reconciliation import reconcile
 from .schemas import (
+    DEFAULT_HOLD_SECONDS,
     AccountIn,
     AccountOut,
     BalanceOut,
@@ -227,21 +228,28 @@ def http_problem(request: Request | None, exc: StarletteHTTPException) -> JSONRe
     return problem(exc.status_code, code, str(exc.detail), headers=exc.headers)
 
 
-def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threading.Event) -> None:
-    while not stop.wait(interval):
+def run_maintenance(db: Database, ledger: Ledger) -> None:
+    """One maintenance pass. Each task fails on its own: a settlement that can't reach the
+    database, or a bug in one job, still lets holds expire and old keys be purged."""
+    # Payments first: they're what someone is waiting for.
+    tasks = [
+        ("settle_payments", lambda: db.run(ledger.settle_holds), SETTLE_BATCH_SIZE),
+        ("expire_holds", lambda: db.run(ledger.expire_holds), EXPIRY_BATCH_SIZE),
+        ("purge_idempotency_keys", lambda: db.run(idempotency.purge_expired), idempotency.PURGE_BATCH_SIZE),
+        ("purge_events", lambda: db.run(events.purge_expired), events.PURGE_BATCH_SIZE),
+    ]
+    for name, task, batch_size in tasks:
         try:
             # A full batch means there may be more: keep going until one comes back short.
-            # Payments first: they're what someone is waiting for.
-            while db.run(lambda conn: ledger.settle_holds(conn)) == SETTLE_BATCH_SIZE:
+            while task() == batch_size:
                 pass
-            while db.run(lambda conn: ledger.expire_holds(conn)) == EXPIRY_BATCH_SIZE:
-                pass
-            while db.run(idempotency.purge_expired) == idempotency.PURGE_BATCH_SIZE:
-                pass
-            while db.run(events.purge_expired) == events.PURGE_BATCH_SIZE:
-                pass
-        except Exception:  # keep the loop alive; the next tick retries
-            log.exception("maintenance run failed")
+        except Exception:  # keep the other tasks and the loop alive; the next tick retries
+            log.exception("maintenance task failed: %s", name)
+
+
+def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threading.Event) -> None:
+    while not stop.wait(interval):
+        run_maintenance(db, ledger)
 
 
 def serve_app() -> FastAPI:
@@ -475,7 +483,11 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
     @v1.post("/holds", status_code=201, response_model=HoldOut, tags=["holds"])
     def create_hold(body: HoldIn, key: IdempotencyKey, request: Request):
         def create(conn):
-            expires_at = datetime.now(UTC) + timedelta(seconds=body.expires_in_seconds)
+            seconds = body.expires_in_seconds
+            if seconds is None and body.settle_to_account_id is None:
+                seconds = DEFAULT_HOLD_SECONDS
+            # A payment has no expiry; if one was sent anyway, the ledger refuses it.
+            expires_at = None if seconds is None else datetime.now(UTC) + timedelta(seconds=seconds)
             return ledger(request).create_hold(
                 conn, body.account_id, body.amount, expires_at, body.description, body.settle_to_account_id
             )

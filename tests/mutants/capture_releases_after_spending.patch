@@ -1,0 +1,33 @@
+Mutant: capture_hold releases the hold's reservation after spending, not before.
+
+The capture boundary bug: the debit entries land while the hold still counts as
+held, so for that moment the account's available amount is short by the whole
+hold. Any capture where amount + hold > what was available before the hold
+(capturing the last of the funds, or most of them) is refused by the database's
+overdraft CHECK. The README's original planted bug (a partial capture releasing
+only the captured amount) can't be replayed: since migration 005 the release is
+done by a trigger from the hold's own amount, so this is the equivalent mutant on
+the same boundary in today's code.
+
+Check that the tests catch it (each target must fail with it, pass without it):
+  python scripts/mutation_check.py tests/mutants/capture_releases_after_spending.patch \
+      tests/test_holds.py::test_a_capture_at_the_funds_boundary_succeeds tests/test_invariants.py
+
+--- a/src/tally/ledger.py	2026-10-31 12:26:01
++++ b/src/tally/ledger.py	2026-10-31 12:26:01
+@@ -287,14 +287,12 @@
+         self._check_postable(released, legs)
+ 
+         transaction = self._insert_transaction(conn, description or hold["description"], {"hold_id": str(hold_id)})
+-        # Marking the hold captured releases its reservation (database trigger), so it
+-        # happens before the entries move the balance.
++        transaction = self._insert_entries(conn, transaction, accounts, legs)
+         captured = conn.execute(
+             f"UPDATE holds SET status = 'captured', captured_transaction_id = %s "
+             f"WHERE id = %s RETURNING {HOLD_COLUMNS}",
+             (transaction["id"], hold_id),
+         ).fetchone()
+-        transaction = self._insert_entries(conn, transaction, accounts, legs)
+         return {"hold": captured, "transaction": transaction}
+ 
+     def void_hold(self, conn: Connection, hold_id: UUID) -> dict:

@@ -28,6 +28,7 @@ def payment(books, wallet):
         "UPDATE entries SET amount = amount + 1",
         "DELETE FROM entries",
         "UPDATE transactions SET description = 'edited'",
+        "UPDATE transactions SET created_xid = pg_current_xact_id()",  # unsealing it
         "DELETE FROM transactions",
     ],
 )
@@ -161,6 +162,21 @@ def test_an_active_hold_keeps_its_amount_and_tracks_updates(raw, active_hold):
     ).fetchone()[0]
 
     assert updated > active_hold["updated_at"]
+
+
+@pytest.mark.parametrize("status", ["active", "captured", "expired"])
+def test_only_a_voided_hold_carries_a_void_reason(raw, active_hold, status):
+    with pytest.raises(psycopg.errors.CheckViolation, match="holds_void_reason_only_when_voided"):
+        raw.execute(
+            "UPDATE holds SET status = %(status)s, void_reason = 'made up', captured_transaction_id = CASE "
+            "WHEN %(status)s = 'captured' THEN (SELECT id FROM transactions LIMIT 1) END WHERE id = %(id)s",
+            {"status": status, "id": active_hold["id"]},
+        )
+
+
+def test_a_voided_hold_can_carry_a_void_reason(raw, active_hold):
+    raw.execute("UPDATE holds SET status = 'voided', void_reason = 'refused' WHERE id = %s", (active_hold["id"],))
+    raw.commit()
 
 
 def test_holds_cannot_be_deleted(raw, active_hold):
@@ -325,3 +341,48 @@ def test_the_audit_log_is_append_only(raw, db, api_key):
         with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="append-only"):
             raw.execute(statement)
         raw.rollback()
+
+
+def append_pair(conn, transaction_id, debit_id, credit_id) -> None:
+    conn.execute(
+        "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) VALUES "
+        "(%s, %s, 'debit', 5, 'USD', 0), (%s, %s, 'credit', 5, 'USD', 0)",
+        (transaction_id, debit_id, transaction_id, credit_id),
+    )
+
+
+@pytest.mark.parametrize("target", ["committed", "reversed", "reversal"])
+def test_a_committed_transaction_is_sealed(raw, db, books, payment, target):
+    # A balanced pair passes the deferred balance check, so before sealing this rewrote
+    # history and still reconciled.
+    from tally.reconciliation import reconcile
+
+    alice, bob = (e["account_id"] for e in payment["entries"])
+    reversal = books.reverse(payment["id"]) if target != "committed" else None
+    transaction_id = reversal["id"] if target == "reversal" else payment["id"]
+    before = raw.execute("SELECT id, balance FROM accounts ORDER BY id").fetchall()
+    raw.commit()
+
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="sealed"):
+        append_pair(raw, transaction_id, alice, bob)  # would leave every balance non-negative
+    raw.rollback()
+
+    assert raw.execute("SELECT id, balance FROM accounts ORDER BY id").fetchall() == before
+    assert raw.execute("SELECT count(*) FROM entries WHERE transaction_id = %s", (transaction_id,)).fetchone()[0] == 2
+    assert db.run(reconcile)["ok"]
+
+
+def test_the_creating_transaction_can_add_entries_over_several_statements(raw, db, wallet):
+    from tally.reconciliation import reconcile
+
+    alice, bob = wallet("alice", funded=1_000), wallet("bob")
+    # A caller can't stamp a transaction with another session's id: the database overrides it.
+    txn = raw.execute("INSERT INTO transactions (client_id, created_xid) VALUES (1, '3') RETURNING id").fetchone()[0]
+    append_pair(raw, txn, alice["id"], bob["id"])
+    append_pair(raw, txn, alice["id"], bob["id"])
+    stamped = raw.execute("SELECT created_xid = pg_current_xact_id() FROM transactions WHERE id = %s", (txn,))
+    assert stamped.fetchone()[0]
+    raw.commit()
+
+    assert raw.execute("SELECT balance FROM accounts WHERE id = %s", (bob["id"],)).fetchone()[0] == 10
+    assert db.run(reconcile)["ok"]

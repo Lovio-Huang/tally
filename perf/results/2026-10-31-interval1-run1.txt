@@ -1,0 +1,25 @@
+200 wallets funded with 10000 each
+
+[spread] 5000 requests, concurrency 100
+  accepted    5000 transfers completed in 2.32 s: 2,159 /s
+  latency     p50 42.3 ms   p95 88.8 ms   p99 120.3 ms   (request sent -> response read)
+  outcomes    ok=5000
+  lock wait   mean 11.2 ms over 5000 lock acquisitions (server /metrics)
+
+[hotspot] 5000 requests, concurrency 100
+  accepted    5000 transfers completed in 8.74 s: 572 /s
+  latency     p50 41.9 ms   p95 1005.5 ms   p99 1559.8 ms   (request sent -> response read)
+  outcomes    ok=5000
+  lock wait   mean 135.9 ms over 5000 lock acquisitions (server /metrics)
+
+[hotspot, batched] 5000 requests, concurrency 100
+  accepted    5000 payments accepted (reserved, not yet settled) in 2.36 s: 2,118 /s
+  latency     p50 35.1 ms   p95 97.3 ms   p99 158.7 ms   (request sent -> response read)
+  outcomes    ok=5000
+  lock wait   mean 16.2 ms over 5050 lock acquisitions (server /metrics)
+  settlement  captured=5000 voided=0 expired=0 active=0   (not accepted: 0)
+  completed   5000 payments credited 3.07 s after the first request: 1,628 /s end to end
+              the last settled 0.71 s after the last was accepted
+
+reconciliation ok: True   money conserved: True (2000000 == 2000000)
+unexpected outcomes: none

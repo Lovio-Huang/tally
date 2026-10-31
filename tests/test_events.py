@@ -47,7 +47,7 @@ def test_a_transfer_is_one_event_carrying_its_entries(client, wallet):
     ]
 
 
-def test_every_kind_of_change_is_an_event(client, books, wallet):
+def test_every_kind_of_change_is_an_event(client, db, books, wallet):
     alice, bob = wallet("alice", funded=500), wallet("bob")
     payment = books.transfer(alice["id"], bob["id"], 10)
     books.reverse(payment["id"])
@@ -56,7 +56,7 @@ def test_every_kind_of_change_is_an_event(client, books, wallet):
     voided = books.create_hold(alice["id"], 5, datetime.now(UTC) + timedelta(days=1))
     books.void_hold(voided["id"])
     expiring = books.create_hold(alice["id"], 5, datetime.now(UTC) + timedelta(days=1))
-    books.db.run(
+    db.run(  # as the owner: the API's role can't change an expiry
         lambda conn: conn.execute(
             "UPDATE holds SET expires_at = now() - interval '1 second' WHERE id = %s", (expiring["id"],)
         )

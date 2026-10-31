@@ -1,11 +1,14 @@
 """The migration runner and the indexes it creates."""
 
 import uuid
+from uuid import UUID
 
 import psycopg
 import pytest
 
-from tally.db import MigrationError, _migration_files, _statements, migrate
+from tally.db import Database, MigrationError, _migration_files, _statements, migrate
+from tally.ledger import Ledger
+from tally.reconciliation import reconcile
 
 # Built CONCURRENTLY (migrations 002 and 007), so they could be left INVALID by a failed build.
 INDEXES = (
@@ -135,3 +138,85 @@ def test_an_unknown_target_version_is_an_error(scratch_database):
 def test_function_bodies_are_refused_in_no_transaction_files():
     with pytest.raises(ValueError, match="function bodies"):
         _statements("-- migration: no-transaction\nCREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;")
+
+
+def test_payments_waiting_at_the_upgrade_lose_their_expiry_and_still_settle(scratch_database):
+    # Before 010 a payment carried an expiry and settlement skipped expired ones: one whose
+    # expiry passed while maintenance was behind expired unsettled after a 201.
+    migrate(scratch_database, until="009_batched_settlement")
+    db = Database(scratch_database, min_size=1, max_size=2)
+    try:
+        books = Ledger(1)  # the 'default' client migration 006 creates
+
+        def seed(conn):
+            cash = books.create_account(conn, "cash", "asset", "USD", allow_negative=True)
+            wallet = books.create_account(conn, "wallet", "liability", "USD")
+            merchant = books.create_account(conn, "merchant", "liability", "USD")
+            books.transfer(conn, cash["id"], wallet["id"], 1_000)
+
+            def hold(expiry: str, destination: int | None, status: str = "active") -> UUID:
+                hold_id = conn.execute(
+                    f"INSERT INTO holds (account_id, amount, expires_at, settle_to_account_id) "
+                    f"VALUES (%s, 10, now() + interval '{expiry}', %s) RETURNING id",
+                    (wallet["id"], destination),
+                ).fetchone()["id"]
+                if status != "active":
+                    conn.execute("UPDATE holds SET status = %s WHERE id = %s", (status, hold_id))
+                return hold_id
+
+            return merchant, {
+                "overdue payment": hold("-1 minute", merchant["id"]),
+                "waiting payment": hold("1 day", merchant["id"]),
+                "voided payment": hold("1 day", merchant["id"], "voided"),
+                "card hold": hold("1 day", None),
+            }
+
+        merchant, holds = db.run(seed)
+        migrate(scratch_database)
+
+        def expiries(conn) -> dict:
+            rows = conn.execute("SELECT id, expires_at FROM holds").fetchall()
+            by_id = {row["id"]: row["expires_at"] for row in rows}
+            return {name: by_id[hold_id] is None for name, hold_id in holds.items()}
+
+        # Waiting payments stop their clocks; finished ones and ordinary holds keep theirs.
+        assert db.run(expiries) == {
+            "overdue payment": True,
+            "waiting payment": True,
+            "voided payment": False,
+            "card hold": False,
+        }
+        assert db.run(Ledger().expire_holds) == 0
+        assert db.run(Ledger().settle_holds) == 2
+        assert db.run(lambda conn: books.get_account(conn, merchant["id"]))["balance"] == 20
+        assert db.run(reconcile)["ok"]
+    finally:
+        db.close()
+
+
+def test_transactions_from_before_sealing_are_sealed_too(scratch_database):
+    migrate(scratch_database, until="010_payment_lifecycle")
+    db = Database(scratch_database, min_size=1, max_size=2)
+    try:
+        books = Ledger(1)
+
+        def seed(conn):
+            cash = books.create_account(conn, "cash", "asset", "USD", allow_negative=True)
+            wallet = books.create_account(conn, "wallet", "liability", "USD")
+            return cash, wallet, books.transfer(conn, cash["id"], wallet["id"], 100)
+
+        cash, wallet, old = db.run(seed)
+        migrate(scratch_database)
+
+        with psycopg.connect(scratch_database) as raw:
+            assert raw.execute("SELECT created_xid FROM transactions WHERE id = %s", (old["id"],)).fetchone() == (None,)
+            with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="sealed"):
+                raw.execute(
+                    "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) "
+                    "VALUES (%s, %s, 'debit', 5, 'USD', 0), (%s, %s, 'credit', 5, 'USD', 0)",
+                    (old["id"], wallet["id"], old["id"], cash["id"]),
+                )
+        db.run(lambda conn: books.transfer(conn, cash["id"], wallet["id"], 1))  # new postings still work
+        assert db.run(reconcile)["ok"]
+    finally:
+        db.close()
