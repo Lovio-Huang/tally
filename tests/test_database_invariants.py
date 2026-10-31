@@ -164,6 +164,21 @@ def test_an_active_hold_keeps_its_amount_and_tracks_updates(raw, active_hold):
     assert updated > active_hold["updated_at"]
 
 
+@pytest.mark.parametrize("status", ["active", "captured", "expired"])
+def test_only_a_voided_hold_carries_a_void_reason(raw, active_hold, status):
+    with pytest.raises(psycopg.errors.CheckViolation, match="holds_void_reason_only_when_voided"):
+        raw.execute(
+            "UPDATE holds SET status = %(status)s, void_reason = 'made up', captured_transaction_id = CASE "
+            "WHEN %(status)s = 'captured' THEN (SELECT id FROM transactions LIMIT 1) END WHERE id = %(id)s",
+            {"status": status, "id": active_hold["id"]},
+        )
+
+
+def test_a_voided_hold_can_carry_a_void_reason(raw, active_hold):
+    raw.execute("UPDATE holds SET status = 'voided', void_reason = 'refused' WHERE id = %s", (active_hold["id"],))
+    raw.commit()
+
+
 def test_holds_cannot_be_deleted(raw, active_hold):
     with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="permanent"):
         raw.execute("DELETE FROM holds WHERE id = %s", (active_hold["id"],))

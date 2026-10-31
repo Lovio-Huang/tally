@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.rows import dict_row
 
 from tally import api, auth
 from tally.api import create_app
@@ -363,6 +364,112 @@ def test_settlement_and_expiry_racing_settle_each_payment_once_and_release_each_
     assert {alice.hold(c)["status"] for c in cards} == {"expired"}
     assert [alice.balance(p) for p in payers] == [{"balance": 955, "held": 0}] * 4
     assert alice.balance(merchant)["balance"] == 180
+    assert db.run(reconcile)["ok"]
+
+
+# --- an owner's void racing settlement: one terminal state, money and reservation moved once --
+
+
+def waiting_for_a_lock(db) -> bool:
+    """Polls until some session is queued behind a row lock (at most 5 s)."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if db.run(lambda conn: conn.execute("SELECT count(*) AS n FROM pg_locks WHERE NOT granted").fetchone()["n"]):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_void_in_progress_makes_settlement_pass_the_payment_by(app_db, runtime_url, tenant):
+    alice = tenant("alice")
+    wallet, merchant = alice.funded("wallet"), alice.account("merchant", "liability")
+    payment = alice.pay(wallet, merchant, 40).json()["id"]
+
+    with psycopg.connect(runtime_url, row_factory=dict_row) as voiding:
+        Ledger(alice.id).void_hold(voiding, payment)  # not committed: it holds the payment's row
+        assert app_db.run(Ledger().settle_holds) == 0  # SKIP LOCKED: settlement doesn't wait, or take it
+        voiding.commit()
+    assert app_db.run(Ledger().settle_holds) == 0
+
+    hold = alice.hold(payment)
+    assert (hold["status"], hold["void_reason"], hold["captured_transaction_id"]) == ("voided", None, None)
+    assert alice.balance(wallet) == {"balance": 1_000, "held": 0}
+    assert alice.balance(merchant)["balance"] == 0
+
+
+def test_a_void_arriving_during_settlement_waits_and_finds_it_settled(db, runtime_url, tenant):
+    alice = tenant("alice")
+    wallet, merchant = alice.funded("wallet"), alice.account("merchant", "liability")
+    payment = alice.pay(wallet, merchant, 40).json()["id"]
+
+    with psycopg.connect(runtime_url, row_factory=dict_row) as settling, ThreadPoolExecutor(1) as pool:
+        assert Ledger().settle_holds(settling) == 1  # not committed: it holds the payment's row
+        void = pool.submit(alice.post, f"/v1/holds/{payment}/void", {})
+        assert waiting_for_a_lock(db), "the void should queue behind settlement's lock"
+        settling.commit()
+        response = void.result(timeout=10)
+
+    assert (response.status_code, response.json()["code"]) == (409, "HOLD_NOT_ACTIVE")
+    assert alice.hold(payment)["status"] == "captured"
+    assert alice.balance(wallet) == {"balance": 960, "held": 0}
+    assert alice.balance(merchant)["balance"] == 40
+
+
+def test_voids_racing_settlement_leave_each_payment_one_outcome(db, app_db, tenant):
+    alice = tenant("alice")
+    merchant = alice.account("merchant", "liability")
+    payers = [alice.funded(f"payer {i}") for i in range(4)]
+    payments = {p["id"]: [] for p in payers}
+    for payer in payers:
+        for amount in range(1, 26):
+            payments[payer["id"]].append((alice.pay(payer, merchant, amount).json()["id"], amount))
+    start = threading.Barrier(5)
+
+    def void_all(payer_id):
+        start.wait()
+        return [(hold, amount, alice.post(f"/v1/holds/{hold}/void", {})) for hold, amount in payments[payer_id]]
+
+    def settle():
+        start.wait()
+        while app_db.run(lambda conn: Ledger().settle_holds(conn, limit=7)):
+            pass
+
+    with ThreadPoolExecutor(5) as pool:
+        settler = pool.submit(settle)
+        voids = [pool.submit(void_all, payer_id) for payer_id in payments]
+        settler.result()
+        results = {payer_id: future.result() for payer_id, future in zip(payments, voids, strict=True)}
+    settle_rest = app_db.run(Ledger().settle_holds)  # whatever the voiders passed by after the settler stopped
+
+    captured_total = 0
+    for payer in payers:
+        captured = 0
+        for hold, amount, response in results[payer["id"]]:
+            status = alice.hold(hold)["status"]
+            # The void's answer and the final state agree: it won (200, voided) or it lost (409, captured).
+            if response.status_code == 200:
+                assert status == "voided"
+            else:
+                assert (response.json()["code"], status) == ("HOLD_NOT_ACTIVE", "captured")
+                captured += amount
+        assert alice.balance(payer) == {"balance": 1_000 - captured, "held": 0}  # each reservation released once
+        captured_total += captured
+    assert settle_rest == 0
+    assert alice.balance(merchant)["balance"] == captured_total  # each payment credited at most once
+    # Every settlement transaction debits exactly the payments captured into it, once each.
+    batches = db.run(
+        lambda conn: conn.execute(
+            "SELECT (SELECT count(*) FROM entries e WHERE e.transaction_id = t.id AND e.direction = 'debit') AS debits,"
+            " (SELECT sum(amount) FROM entries e WHERE e.transaction_id = t.id AND e.direction = 'debit') AS paid,"
+            " (SELECT count(*) FROM holds h WHERE h.captured_transaction_id = t.id) AS holds,"
+            " (SELECT sum(amount) FROM holds h WHERE h.captured_transaction_id = t.id) AS held"
+            "  FROM transactions t WHERE t.description LIKE 'Settlement%'"
+        ).fetchall()
+    )
+    assert all((b["debits"], b["paid"]) == (b["holds"], b["held"]) for b in batches), batches
+    statuses = db.run(lambda conn: conn.execute("SELECT status, count(*) AS n FROM holds GROUP BY 1").fetchall())
+    assert {r["status"] for r in statuses} <= {"captured", "voided"}
+    assert sum(b["holds"] for b in batches) == sum(r["n"] for r in statuses if r["status"] == "captured")
     assert db.run(reconcile)["ok"]
 
 

@@ -12,8 +12,11 @@
 ALTER TABLE holds ALTER COLUMN expires_at DROP NOT NULL;
 
 -- Why a hold was voided by the system rather than by its owner, e.g. a payment that
--- settlement couldn't post. NULL for holds voided through the API.
-ALTER TABLE holds ADD COLUMN void_reason TEXT CHECK (length(void_reason) <= 500);
+-- settlement couldn't post. NULL for holds voided through the API, and for any hold
+-- that wasn't voided: a reason on an active or captured hold would be a false record.
+ALTER TABLE holds ADD COLUMN void_reason TEXT
+    CHECK (length(void_reason) <= 500)
+    CONSTRAINT holds_void_reason_only_when_voided CHECK (void_reason IS NULL OR status = 'voided');
 
 -- Payments still waiting: stop their clocks. (Updating an active hold's expiry is
 -- allowed; the lifecycle trigger only protects account, amount, destination and
