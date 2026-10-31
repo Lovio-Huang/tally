@@ -192,3 +192,31 @@ def test_payments_waiting_at_the_upgrade_lose_their_expiry_and_still_settle(scra
         assert db.run(reconcile)["ok"]
     finally:
         db.close()
+
+
+def test_transactions_from_before_sealing_are_sealed_too(scratch_database):
+    migrate(scratch_database, until="010_payment_lifecycle")
+    db = Database(scratch_database, min_size=1, max_size=2)
+    try:
+        books = Ledger(1)
+
+        def seed(conn):
+            cash = books.create_account(conn, "cash", "asset", "USD", allow_negative=True)
+            wallet = books.create_account(conn, "wallet", "liability", "USD")
+            return cash, wallet, books.transfer(conn, cash["id"], wallet["id"], 100)
+
+        cash, wallet, old = db.run(seed)
+        migrate(scratch_database)
+
+        with psycopg.connect(scratch_database) as raw:
+            assert raw.execute("SELECT created_xid FROM transactions WHERE id = %s", (old["id"],)).fetchone() == (None,)
+            with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="sealed"):
+                raw.execute(
+                    "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) "
+                    "VALUES (%s, %s, 'debit', 5, 'USD', 0), (%s, %s, 'credit', 5, 'USD', 0)",
+                    (old["id"], wallet["id"], old["id"], cash["id"]),
+                )
+        db.run(lambda conn: books.transfer(conn, cash["id"], wallet["id"], 1))  # new postings still work
+        assert db.run(reconcile)["ok"]
+    finally:
+        db.close()
