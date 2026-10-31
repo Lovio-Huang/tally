@@ -32,7 +32,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install -r requirements.txt -e ".[dev]"
+          cache-dependency-path: requirements*.txt
+      # Exact versions of every tool and dependency (requirements-dev.txt), then Tally itself
+      # without letting pip pick anything else; the same command as in the README.
+      - run: pip install -r requirements-dev.txt && pip install --no-deps -e . && pip check
       - if: matrix.python == '3.14'
         run: ruff check src tests scripts && ruff format --check src tests scripts
       - run: pytest -q --cov # fails under 90% branch coverage (pyproject.toml)
