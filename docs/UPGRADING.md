@@ -76,7 +76,16 @@ SELECT id, client_id, account_id, settle_to_account_id, amount, created_at, void
 ```
 
 The maintenance log line `maintenance task failed: <task>` means a task failed and will be retried at the next
-interval; it never means payments were voided.
+interval; it never means payments were voided. `settlement group failed; its payments stay pending` means one
+destination's payments couldn't be posted for a reason other than a ledger rule (its fields say which client,
+destination, how many and why); they stay active and reserved, are retried every minute, and the rest of the
+queue keeps settling. Payments still active long after the upgrade are found with:
+
+```sql
+SELECT client_id, settle_to_account_id, count(*), min(created_at)
+  FROM holds WHERE status = 'active' AND settle_to_account_id IS NOT NULL AND created_at < now() - interval '5 minutes'
+ GROUP BY 1, 2;
+```
 
 ## Retrying, and when a migration fails
 

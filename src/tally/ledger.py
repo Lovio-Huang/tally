@@ -26,6 +26,7 @@ update is ever lost.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,6 +35,7 @@ from uuid import UUID
 
 import psycopg
 from psycopg import Connection
+from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
 from .errors import LedgerError, conflict, not_found, unprocessable
@@ -52,6 +54,16 @@ EXPIRY_BATCH_SIZE = 500
 # The deferred balance check runs once per entry over the whole transaction, so cost grows
 # with the square of the batch; 100 (the API's own entry limit) keeps a batch to milliseconds.
 SETTLE_BATCH_SIZE = 100
+# A destination's group that failed for a reason other than a ledger rule is passed over
+# by this process for this long, so it can't keep the oldest slots of every batch.
+SETTLE_RETRY_SECONDS = 60.0
+# Errors that belong to one group's statements and leave the transaction usable once its
+# savepoint is rolled back, by SQLSTATE: bad data (22), a violated constraint (23), a
+# trigger's RAISE (P0), a trigger of ours refusing a change (55000). Everything else is
+# the batch's problem, not the group's: a lost connection or server (08, 57, 53, 58, XX),
+# a lock or statement timeout (55P03, 57014), a deadlock or serialization failure (40), a
+# missing privilege (42). Those roll the batch back to be retried as a whole.
+GROUP_SQLSTATES = ("22", "23", "P0", "55000")
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +98,15 @@ def opposite(direction: str) -> Direction:
     return "credit" if direction == "debit" else "debit"
 
 
+def confined_to_group(error: Exception) -> bool:
+    """Whether a settlement group's failure can be rolled back to its savepoint and skipped."""
+    if isinstance(error, psycopg.Error):
+        return (error.sqlstate or "").startswith(GROUP_SQLSTATES)
+    # A bug in the group's own code: its statements were rolled back with the savepoint,
+    # and the next group starts from balances read afresh.
+    return True
+
+
 def payment_problem(payer: dict[str, Any], destination: dict[str, Any]) -> tuple[str, str] | None:
     """Why a payment from ``payer`` to ``destination`` can't be settled, as (code, message), or None.
 
@@ -110,6 +131,8 @@ def payment_problem(payer: dict[str, Any], destination: dict[str, Any]) -> tuple
 class Ledger:
     def __init__(self, client_id: int | None = None) -> None:
         self.client_id = client_id
+        # Payments whose settlement group failed, and until when (monotonic) to pass them over.
+        self._settle_later: dict[UUID, float] = {}
 
     # --- accounts -----------------------------------------------------------------
 
@@ -323,26 +346,34 @@ class Ledger:
         return len(expired)
 
     def settle_holds(self, conn: Connection, limit: int = SETTLE_BATCH_SIZE) -> int:
-        """Settles one batch of the oldest pending payments; returns how many it took off the queue.
+        """Settles one batch of the oldest pending payments; returns how many it took up.
 
         Each destination gets one transaction per batch: a debit from every payer, then one
         credit for the total, so the destination's row is locked once per batch instead of
         once per payment. Global, like expiry: each transaction belongs to its holds' client.
 
         One client's bad payment must not hold up everyone else's. A payment that can't be
-        settled under the ledger's rules (see ``payment_problem``) is voided on its own,
-        and each destination's transaction is posted under a savepoint: if posting it
-        breaks a ledger rule (a ``LedgerError``), only that group is undone and voided,
-        with the reason recorded in ``void_reason``; the others are still settled. Any other
-        error (a lost connection, a database failure, a bug) is not a verdict on the
-        payments: it propagates, the whole batch rolls back, and the payments stay active
-        for the next run.
+        settled under the ledger's rules (see ``payment_problem``) is voided on its own, and
+        each destination's group is posted under a savepoint:
+
+        * the ledger refuses it (a ``LedgerError``): the group is undone and voided, with
+          the reason in ``void_reason``;
+        * it fails in a way confined to its own statements (``confined_to_group``: bad data,
+          a constraint or trigger the checks here don't know, a bug in this code): the group
+          is undone and left pending, reservations intact, nothing voided. The failure is
+          logged, and this Ledger passes those payments over for ``SETTLE_RETRY_SECONDS`` so
+          the payments behind them in the queue still get settled;
+        * anything else (a lost connection, the database failing, a timeout or deadlock):
+          it propagates, the whole batch rolls back, and every payment in it is retried at
+          the next run.
         """
+        now = time.monotonic()
+        self._settle_later = {hold_id: until for hold_id, until in self._settle_later.items() if until > now}
         holds = conn.execute(
             f"SELECT {HOLD_COLUMNS}, client_id FROM holds "
-            "WHERE status = 'active' AND settle_to_account_id IS NOT NULL "
+            "WHERE status = 'active' AND settle_to_account_id IS NOT NULL AND NOT (id = ANY(%s)) "
             "ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED",
-            (limit,),
+            (list(self._settle_later), limit),
         ).fetchall()
         if not holds:
             return 0
@@ -361,14 +392,50 @@ class Ledger:
                 by_destination[(hold["client_id"], hold["settle_to_account_id"])].append(hold)
 
         for (client_id, destination), batch in by_destination.items():
-            try:
-                with conn.transaction():  # a savepoint: a refused group is undone on its own
-                    self._settle_group(conn, client_id, destination, batch, accounts)
-            except LedgerError as refused:
-                self._void_payments(conn, batch, f"{refused.code}: {refused.message}")
+            failure = self._in_savepoint(conn, self._settle_group, conn, client_id, destination, batch, accounts)
+            if isinstance(failure, LedgerError):
+                reason = f"{failure.code}: {failure.message}"
+                failure = self._in_savepoint(conn, self._void_payments, conn, batch, reason)
+            if failure is not None:
+                self._settle_group_later(client_id, destination, batch, failure)
             # Later groups check against balances as they are now, not as they were locked.
             accounts.update(self._read_accounts(conn, involved))
         return len(holds)
+
+    def _in_savepoint(self, conn: Connection, work, *args) -> Exception | None:
+        """Runs ``work(*args)`` under a savepoint. Returns a ledger refusal, or a failure confined
+        to the savepoint (rolled back with it); raises anything that may have broken the transaction."""
+        try:
+            with conn.transaction():
+                work(*args)
+        except LedgerError as refused:
+            return refused
+        except Exception as error:
+            # The rollback to the savepoint must have worked, too: a broken or aborted
+            # transaction is never used again.
+            if not confined_to_group(error) or conn.broken or conn.info.transaction_status != TransactionStatus.INTRANS:
+                raise
+            return error
+        return None
+
+    def _settle_group_later(self, client_id: int, destination: int, batch: list[dict], failure: Exception) -> None:
+        until = time.monotonic() + SETTLE_RETRY_SECONDS
+        self._settle_later.update(dict.fromkeys((h["id"] for h in batch), until))
+        log.error(
+            "settlement group failed; its payments stay pending",
+            extra={
+                "event": "settlement_group_failed",
+                "client_id": client_id,
+                "destination_account_id": destination,
+                "payments": len(batch),
+                "amount": sum(h["amount"] for h in batch),
+                "oldest_payment_id": str(batch[0]["id"]),
+                "error": type(failure).__name__,
+                "sqlstate": getattr(failure, "sqlstate", None),
+                "detail": str(failure).splitlines()[0][:300] if str(failure) else "",
+                "retry_in_seconds": SETTLE_RETRY_SECONDS,
+            },
+        )
 
     def _settle_group(
         self, conn: Connection, client_id: int, destination: int, batch: list[dict], accounts: dict[int, dict]

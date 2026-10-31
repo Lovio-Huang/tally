@@ -13,11 +13,14 @@ from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 
 from tally import api, auth
+from tally import ledger as ledger_module
 from tally.api import create_app
 from tally.config import Settings
 from tally.errors import LedgerError
-from tally.ledger import Ledger
+from tally.ledger import SETTLE_RETRY_SECONDS, Ledger, confined_to_group
 from tally.reconciliation import reconcile
+
+ORIGINAL_INSERT_ENTRIES = Ledger._insert_entries
 
 
 class Tenant:
@@ -228,16 +231,26 @@ def test_a_group_refused_at_posting_is_undone_and_voided_while_the_next_group_se
 
 
 @pytest.mark.parametrize(
-    "error", [psycopg.OperationalError("server closed the connection"), RuntimeError("a bug"), KeyError("x")]
+    "error",
+    [
+        psycopg.OperationalError("server closed the connection unexpectedly"),
+        psycopg.errors.AdminShutdown("terminating connection due to administrator command"),
+        psycopg.errors.LockNotAvailable("canceling statement due to lock timeout"),
+        psycopg.errors.QueryCanceled("canceling statement due to statement timeout"),
+        psycopg.errors.InsufficientPrivilege("permission denied for table entries"),
+    ],
+    ids=lambda error: type(error).__name__,
 )
-def test_an_unexpected_error_voids_nothing_and_the_next_run_settles_everything(
+def test_a_failure_of_the_whole_batch_voids_nothing_and_the_next_run_settles_everything(
     app_db, db, tenant, monkeypatch, caplog, error
 ):
+    # The connection, the server, a timeout, a missing privilege: not the group's own
+    # doing, so the batch rolls back as a whole and is retried, nothing skipped or voided.
     alice, shop, payers, alice_payments, bob, bob_shop, bob_payment = two_groups(tenant)
     before = snapshot(db)
     refuse_posting_to(monkeypatch, shop, error)
 
-    with caplog.at_level(logging.ERROR, logger="tally.api"):
+    with caplog.at_level(logging.ERROR):
         api.run_maintenance(app_db, Ledger())
 
     assert [r.getMessage() for r in caplog.records] == ["maintenance task failed: settle_payments"]
@@ -247,6 +260,158 @@ def test_an_unexpected_error_voids_nothing_and_the_next_run_settles_everything(
     assert {alice.hold(p)["status"] for p in alice_payments} == {"captured"}
     assert bob.hold(bob_payment)["status"] == "captured"
     assert (alice.balance(shop)["balance"], bob.balance(bob_shop)["balance"]) == (60, 40)
+
+
+def test_a_connection_killed_mid_settlement_rolls_the_batch_back_and_the_next_run_recovers(
+    app_db, db, tenant, monkeypatch, caplog
+):
+    # Not an exception made up by the test: the server really ends the session halfway
+    # through a group, after its transaction row and hold updates were written.
+    alice, shop, payers, alice_payments, bob, bob_shop, bob_payment = two_groups(tenant)
+    before = snapshot(db)
+    original = Ledger._insert_entries
+
+    def insert(self, conn, transaction, accounts, legs):
+        if any(leg.account_id == shop["id"] for leg in legs):
+            conn.execute("SELECT pg_terminate_backend(pg_backend_pid())")
+        return original(self, conn, transaction, accounts, legs)
+
+    monkeypatch.setattr(Ledger, "_insert_entries", insert)
+    with caplog.at_level(logging.ERROR):
+        api.run_maintenance(app_db, Ledger())
+
+    assert [r.getMessage() for r in caplog.records] == ["maintenance task failed: settle_payments"]
+    assert snapshot(db) == before
+    monkeypatch.undo()
+    api.run_maintenance(app_db, Ledger())  # the pool replaced the dead connection
+    assert {alice.hold(p)["status"] for p in alice_payments} == {"captured"}
+    assert bob.hold(bob_payment)["status"] == "captured"
+    api.run_maintenance(app_db, Ledger())
+    assert (alice.balance(shop)["balance"], bob.balance(bob_shop)["balance"]) == (60, 40)  # settled once
+    assert db.run(reconcile)["ok"]
+
+
+@pytest.mark.parametrize(
+    ("error", "confined"),
+    [
+        (psycopg.errors.CheckViolation("a constraint the checks don't know"), True),
+        (psycopg.errors.ForeignKeyViolation("x"), True),
+        (psycopg.errors.NumericValueOutOfRange("bigint out of range"), True),
+        (psycopg.errors.RaiseException("a trigger said no"), True),
+        (psycopg.errors.ObjectNotInPrerequisiteState("one of our triggers said no"), True),
+        (KeyError("a bug in the group's own code"), True),
+        (psycopg.OperationalError("server closed the connection"), False),
+        (psycopg.InterfaceError("the connection is closed"), False),
+        (psycopg.errors.AdminShutdown("x"), False),
+        (psycopg.errors.CannotConnectNow("x"), False),
+        (psycopg.errors.DiskFull("x"), False),
+        (psycopg.errors.LockNotAvailable("x"), False),
+        (psycopg.errors.QueryCanceled("x"), False),
+        (psycopg.errors.DeadlockDetected("x"), False),
+        (psycopg.errors.SerializationFailure("x"), False),
+        (psycopg.errors.InsufficientPrivilege("x"), False),
+        (psycopg.errors.UndefinedColumn("x"), False),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, Exception) else str(value),
+)
+def test_which_failures_stay_with_their_group(error, confined):
+    assert confined_to_group(error) is confined
+
+
+class Clock:
+    """Stands in for the time module in tally.ledger: settlement's retry delay without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.mark.parametrize("fault", ["database rule", "bug"])
+def test_a_group_failing_every_run_holds_up_neither_others_nor_the_rest_of_the_queue(
+    app_db, db, tenant, monkeypatch, caplog, fault
+):
+    clock = Clock()
+    monkeypatch.setattr(ledger_module, "time", clock)
+    alice, bob = tenant("alice"), tenant("bob")
+    payer, stuck, other = (
+        alice.funded("payer"),
+        alice.account("stuck shop", "liability"),
+        alice.account("shop", "liability"),
+    )
+    pay = Ledger(alice.id)
+    for _ in range(100):  # the oldest 100: a whole batch, all to the destination that will fail
+        app_db.run(lambda conn: pay.create_hold(conn, payer["id"], 1, None, "", stuck["id"]))
+    later = [alice.pay(payer, other, 7).json()["id"]]  # 101st and on: Alice's other shop, and Bob
+    bob_wallet, bob_shop = bob.funded("wallet"), bob.account("shop", "liability")
+    later += [bob.pay(bob_wallet, bob_shop, 5).json()["id"] for _ in range(3)]
+
+    if fault == "database rule":  # a constraint or trigger the checks in Python don't know about
+        db.run(
+            lambda conn: conn.execute(
+                "CREATE FUNCTION refuse_stuck_shop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                "RAISE EXCEPTION 'refused by a rule settlement does not check' USING ERRCODE = 'check_violation'; "
+                "END $$; "
+                f"CREATE TRIGGER refuse_stuck_shop BEFORE INSERT ON entries FOR EACH ROW "
+                f"WHEN (NEW.account_id = {stuck['id']}) EXECUTE FUNCTION refuse_stuck_shop()"
+            )
+        )
+    else:
+        refuse_posting_to(monkeypatch, stuck, KeyError("a bug that only this group's data reaches"))
+
+    def stuck_state():
+        return db.run(
+            lambda conn: conn.execute(
+                "SELECT (SELECT count(*) FROM holds WHERE settle_to_account_id = %(s)s AND status = 'active' "
+                "        AND void_reason IS NULL AND captured_transaction_id IS NULL) AS active, "
+                "       (SELECT count(*) FROM holds WHERE status = 'voided') AS voided, "
+                "       (SELECT count(*) FROM entries WHERE account_id = %(s)s) AS entries",
+                {"s": stuck["id"]},
+            ).fetchone()
+        )
+
+    failures = []
+    worker = Ledger()  # one API process's maintenance, kept across runs like the real loop
+    with caplog.at_level(logging.ERROR, logger="tally.ledger"):
+        for _ in range(3):  # within the retry delay: the group is tried once, then passed over
+            api.run_maintenance(app_db, worker)
+        failures += [r for r in caplog.records if r.getMessage().startswith("settlement group failed")]
+        assert alice.hold(later[0])["status"] == "captured"  # same client, another destination
+        assert {bob.hold(h)["status"] for h in later[1:]} == {"captured"}
+        assert stuck_state() == {"active": 100, "voided": 0, "entries": 0}
+        assert alice.balance(payer) == {"balance": 993, "held": 100}  # its reservations untouched
+        clock.now += SETTLE_RETRY_SECONDS + 1  # still failing on the next try
+        caplog.clear()
+        api.run_maintenance(app_db, worker)
+        failures += [r for r in caplog.records if r.getMessage().startswith("settlement group failed")]
+
+    assert len(failures) == 2
+    first = failures[0]
+    assert (first.event, first.client_id, first.destination_account_id, first.payments, first.amount) == (
+        "settlement_group_failed",
+        alice.id,
+        stuck["id"],
+        100,
+        100,
+    )
+    assert first.sqlstate == ("23514" if fault == "database rule" else None)
+    assert stuck_state() == {"active": 100, "voided": 0, "entries": 0}
+
+    if fault == "database rule":  # the fault is fixed
+        db.run(
+            lambda conn: conn.execute("DROP TRIGGER refuse_stuck_shop ON entries; DROP FUNCTION refuse_stuck_shop()")
+        )
+    else:
+        monkeypatch.setattr(Ledger, "_insert_entries", ORIGINAL_INSERT_ENTRIES)
+    clock.now += SETTLE_RETRY_SECONDS + 1
+    api.run_maintenance(app_db, worker)
+    api.run_maintenance(app_db, worker)
+
+    assert alice.balance(stuck)["balance"] == 100  # settled, once
+    assert stuck_state()["entries"] == 1
+    assert alice.balance(payer) == {"balance": 893, "held": 0}
+    assert db.run(reconcile)["ok"]
 
 
 def test_repeated_maintenance_neither_posts_nor_releases_twice(app_db, db, migrated, tenant):

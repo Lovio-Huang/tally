@@ -330,14 +330,31 @@ the payer's side is immediate. Two details made it work:
   while it may not go negative (paying a wallet into an empty asset account credits that asset). The rule follows
   from normal sides, not a list of account types: `422 INVALID_DESTINATION`. One written before that check, or
   around the API, is voided on its own. Each destination's group is then posted under a savepoint, so a group
-  the ledger refuses (a `LedgerError`) is undone and voided while the other groups settle. Any other error (a
-  lost connection, a database failure, a bug) is not a verdict on the payments: the whole batch rolls back and
-  they wait for the next run.
+  the ledger refuses (a `LedgerError`) is undone and voided while the other groups settle.
+
+Other failures are never a verdict on the payments, so nothing is voided for them. Which of two kinds a failure
+is decides how much is rolled back:
+
+- **Confined to one group**, by SQLSTATE: bad data (22), a constraint (23), a trigger's `RAISE` (P0) or one of our
+  triggers refusing (55000), or a bug in the group's own Python code. The group's savepoint is rolled back (and
+  the transaction must be intact afterwards, or it counts as the next kind), its payments stay active with their
+  reservations, and the other groups settle. The failure is logged as `settlement group failed; its payments stay
+  pending`, with `event`, `client_id`, `destination_account_id`, `payments`, `amount`, `sqlstate` and `detail`
+  fields. The process then passes those payments over for 60 s, so a group that fails every time can't keep the
+  oldest slots of every batch: the payments queued behind it are still settled.
+- **The whole batch's**: a lost connection or server, a lock or statement timeout, a deadlock, a missing
+  privilege. The batch rolls back and every payment in it is retried at the next run.
+
+The 60 s are remembered per API process: each worker tries a failing group once per minute, and a restart tries
+it again at once. A failure in the steps before the groups (selecting and locking the batch's accounts, for
+instance a lock held elsewhere for longer than the lock timeout) is the whole batch's and holds settlement up for
+as long as it lasts.
 
 A payment can't be captured by hand: its destination was fixed when it was accepted, so `POST .../capture` is
 `409 PAYMENT_SETTLES_AUTOMATICALLY`, whatever destination is sent. The four maintenance tasks (settle payments,
 expire holds, purge idempotency keys, purge events) run one after another, and each failure is logged as
-`maintenance task failed: <task>` without stopping the others.
+`maintenance task failed: <task>` without stopping the others. Stuck payments are visible as active payments
+older than a few maintenance intervals.
 
 ## API
 
@@ -552,14 +569,14 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-304 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for
+326 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for
 the console's JavaScript; warnings fail the run. The API's tests, `books` and the maintenance tests connect as the
 runtime role, not the owner. Coverage, measured on 2026-10-31 with `pytest -q --cov` and `coverage json` from a
 clean `requirements-dev.txt` install (same figures on Python 3.14 and 3.11):
 
 | Statements | Branches | Combined (what `--cov` prints; the 90% floor applies to it) |
 |---|---|---|
-| 98.2% (1,127 of 1,148) | 94.5% (189 of 200) | 97.6% |
+| 98.2% (1,154 of 1,175) | 94.7% (197 of 208) | 97.7% |
 
 An earlier version of this README said "98% branch coverage". Measured the same way on that commit (`a717e4f`), it
 was 96.8% combined, with branches at 91.8% (178 of 194) and statements at 97.7%.
@@ -575,7 +592,7 @@ was 96.8% combined, with branches at 91.8% (178 of 194) and statements at 97.7%.
 | `test_tenancy.py` (13) | Missing, malformed, unknown and revoked keys get `401`; key rotation; only a hash stored; another client's accounts, transactions and holds are `404` for every read and write and no money moves; idempotency keys per client; reconciliation per client; audit rows naming key and request, none for replays or failures, keyless rows for changes made around the API |
 | `test_events.py` (9) | One event per change with the transaction's entries; every kind of change; nothing for a rollback or a commit-time failure; per client; paging resumes exactly; an older transaction committing later is never skipped; batched purge; forged cursors |
 | `test_settlement.py` (11) | A payment reserves on the payer and pays the merchant at settlement, one transaction per batch; bounded batches; paying never waits on the merchant's row lock (a transfer does); destination validation; voided payments skipped; two settlers at once settle each payment once; a payment written around the API can't stall settlement; the destination can't change |
-| `test_payment_lifecycle.py` (25) | Over HTTP with two clients: which destinations a payment may have (9 account-type pairings, refused ones leave no trace); a legacy invalid payment voided alone while another client's settles; a group refused at posting undone by its savepoint and voided while the next settles; connection errors, bugs and unknown errors voiding nothing; repeated maintenance changing nothing; payments refusing an expiry, outliving late and paused maintenance (the review's 1 s reproduction), and settled exactly once while expiry races settlement; an owner's void racing settlement (each interleaving forced with real row locks, then 100 payments voided while a settler runs): one final state per payment, the void's answer matching it, money credited and reservations released once; manual capture of a payment refused for its own, another or no destination |
+| `test_payment_lifecycle.py` (47) | Over HTTP with two clients: which destinations a payment may have (9 account-type pairings, refused ones leave no trace); a legacy invalid payment voided alone while another client's settles; a group refused at posting undone by its savepoint and voided while the next settles; connection errors, bugs and unknown errors voiding nothing; repeated maintenance changing nothing; payments refusing an expiry, outliving late and paused maintenance (the review's 1 s reproduction), and settled exactly once while expiry races settlement; an owner's void racing settlement (each interleaving forced with real row locks, then 100 payments voided while a settler runs): one final state per payment, the void's answer matching it, money credited and reservations released once; a destination whose group fails on every run (a database rule, or a bug) while the 100 payments ahead of the rest are all its own: the payments behind it, its client's other destination's and another client's, still settle, it keeps its reservations with no entries and no void, and settles exactly once when the fault is gone; a connection killed mid-group and other failures of the whole batch rolling everything back; which failures count as the group's (17 cases); manual capture of a payment refused for its own, another or no destination |
 | `test_runtime_role.py` (36) | The API's role is no superuser and owns nothing; 29 escalation attempts refused (disabling triggers, replica mode, `SET ROLE`, editing history, the audit log, events, keys and migration history); columns granted only for locking still can't be written; the API starts as that role and refuses pending migrations; it purges only expired events |
 | `test_cli.py` (21) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C; API keys: only the key on stdout, revoke and list, unknown clients and keys, taken names |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
