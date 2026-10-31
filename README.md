@@ -11,7 +11,8 @@ reconciliation.
 The interesting part is **where the rules live**. "Debits equal credits", "history is never edited"
 and "no overdrafts" are enforced by **PostgreSQL itself** (deferred constraint triggers, CHECK
 constraints, composite foreign keys), not just by application code. A buggy service, a bad script or a
-hand-typed `UPDATE` can't corrupt the books.
+hand-typed `UPDATE` can't corrupt the books; only the schema owner could, by deliberately switching the rules off
+(see [Database roles](#database-roles) for what the database does and doesn't protect).
 
 **Stack:** Python 3.14 · FastAPI · PostgreSQL 17 · psycopg 3 (raw SQL, connection pool) · pytest · Hypothesis (stateful, model-based) · Testcontainers · Docker Compose · GitHub Actions
 
@@ -48,7 +49,7 @@ sum, which is what the reconciliation report checks.
 | A transaction has at least two entries | Deferred constraint trigger on `transactions` | `test_a_transaction_needs_at_least_two_entries` |
 | History is append-only; fixes are reversals | `BEFORE UPDATE OR DELETE` triggers that raise | `test_history_is_append_only` (5 cases) |
 | A committed transaction can't gain entries later (a balanced pair appended to an old transaction would pass the balance check) | Each transaction records the database transaction that created it (`created_xid`, an `xid8` stamped by a trigger); the entry trigger accepts entries only from that same database transaction. Rows from before migration 011 are `NULL`, so sealed too, rather than stamped with an invented id | `test_a_committed_transaction_is_sealed` (committed, reversed, reversal), `test_transactions_from_before_sealing_are_sealed_too` |
-| The API can't switch any of this off | It connects as a role that owns nothing and has column-level grants; audit rows and events are written by `SECURITY DEFINER` functions (migration 012, see [Database roles](#database-roles)) | `test_runtime_role.py`: `DISABLE TRIGGER`, replica mode, `SET ROLE`, editing history, the audit log or keys are all refused |
+| The API can't switch any of this off | It connects as a role that owns nothing and has column-level grants; audit rows and events are written only by `SECURITY DEFINER` trigger functions (migration 012). What still depends on the API: which client a request sees, and which key an audit row names (see [Database roles](#database-roles)) | `test_runtime_role.py`: `DISABLE TRIGGER`, replica mode, `SET ROLE`, editing history, the audit log or keys are all refused |
 | An entry's currency matches its account | Composite FK `(account_id, currency)` → `accounts (id, currency)` | `test_entries_must_use_their_accounts_currency` |
 | Protected accounts never go negative | `CHECK (allow_negative OR balance - held >= 0)`, plus a service-level check under row lock | `test_a_protected_account_can_never_go_negative`, `test_concurrent_withdrawals_never_overdraw` |
 | A transaction is reversed at most once | `UNIQUE (reverses_id)`, plus a row lock on the original | `test_a_transaction_reversed_concurrently_is_reversed_once` |
@@ -159,19 +160,25 @@ ids leak nothing).
   A fast hash is the right choice here: the key is random rather than a password, so there is nothing to brute
   force, and every request can afford the lookup. A client can hold several keys, which is how a key is rotated
   without downtime (`create-key`, move callers over, `revoke-key`). Revocation takes effect on the next request.
-- **Isolation in code and in the database.** The ledger filters every query by client, and an unknown client fails
-  closed (the lookup finds nothing, an insert fails). The database enforces the same boundary the way it enforces
-  currencies: composite foreign keys `(client_id, account_id)` and `(client_id, transaction_id)` make it impossible
-  for a transaction to touch another client's account, whatever the code does. Entries and holds take their client
-  from their transaction and account (triggers), so it can't be faked either. On an existing ledger the keys were
-  added without blocking writes: indexes `CONCURRENTLY`, foreign keys `NOT VALID` and then validated.
+- **Isolation: the application decides what a request sees; the database keeps books from mixing.** The ledger
+  filters every query by the caller's client, and an unknown client fails closed (the lookup finds nothing, an
+  insert fails). That filter is the only thing between one client's request and another client's rows: the
+  database role the API uses can read and write every client's books (there is no row-level security yet, see
+  [Not built](#not-built-yet)). What the database does enforce, whatever the code does, is that books never mix:
+  composite foreign keys `(client_id, account_id)` and `(client_id, transaction_id)` make it impossible for a
+  transaction to touch two clients' accounts, or a payment to settle into another client's account, and entries
+  and holds take their client from their transaction and account (triggers), so that can't be faked either. On an
+  existing ledger the keys were added without blocking writes: indexes `CONCURRENTLY`, foreign keys `NOT VALID`
+  and then validated.
 - **Idempotency keys are per client**, so two clients may pick the same one.
 - **Audit log.** Every change (account opened, transaction posted or reversed, hold created, captured, voided or
   expired) gets an append-only `audit_log` row naming the client, the API key and the request id. Triggers write it,
   inside the statement that makes the change: a committed change always has its record, a rolled-back one never
   does, and no new code path can forget it. The API tells the database who is acting with `set_config(...)` local
   to the transaction, in the same query that checks the key. Changes made any other way (psql, a script, the expiry
-  job) are recorded with no key, which are exactly the rows worth a second look.
+  job) are recorded with no key, which are exactly the rows worth a second look. So the database guarantees that
+  every change has a row and that rows can't be edited or deleted; *who* a row names is only as trustworthy as
+  the API, which could name any key.
 - **Reconciliation** over HTTP covers only the caller's books; `tally reconcile` checks everything, including that no
   entry or hold ever crossed from one client's books into another's.
 
@@ -264,16 +271,20 @@ runtime role), Postgres 17.11 in Docker Desktop, load generator on the same mach
 scenario from 100 concurrent clients, two runs each. Commands, environment and raw output are in
 [`perf/results/`](perf/results/README.md). With `TALLY_MAINTENANCE_INTERVAL=1` (settlement every second):
 
-| Scenario | Accepted /s | p50 | p99 | Lock wait | Completed end to end |
-|---|---|---|---|---|---|
-| **Spread**: random wallet to wallet | 2,160 – 2,167 | 42 ms | 118 – 120 ms | 11 – 13 ms | the same: a transfer is done when answered |
-| **Hotspot**: everyone pays one merchant, by transfer | 565 – 572 | 42 – 48 ms | 1.56 – 1.62 s | 136 – 137 ms | the same |
-| **Hotspot, batched**: the same payments, settled in batches | 1,944 – 2,118 | 35 – 38 ms | 159 – 215 ms | 16 – 20 ms | 1,576 – 1,628 /s; the last payment settled 0.60 – 0.71 s after the last was accepted |
+| Scenario | Accepted /s | HTTP latency p50 / p99 | Lock wait | Completed end to end | Each payment's completion latency | Drain: last settled after last accepted |
+|---|---|---|---|---|---|---|
+| **Spread**: random wallet to wallet | 2,160 – 2,167 | 42 ms / 118 – 120 ms | 11 – 13 ms | = accepted (a transfer is done when answered) | = HTTP latency | n/a |
+| **Hotspot**: everyone pays one merchant, by transfer | 565 – 572 | 42 – 48 ms / 1.56 – 1.62 s | 136 – 137 ms | = accepted | = HTTP latency | n/a |
+| **Hotspot, batched**: the same payments, settled in batches | 1,944 – 2,118 | 35 – 38 ms / 159 – 215 ms, **acceptance only** | 16 – 20 ms | 1,576 – 1,628 /s | not measured | 0.60 – 0.71 s |
 
 *Accepted* is `201` answers per second: for a payment that is the reservation on the payer, not the merchant's
-credit. *Completed end to end* counts captured payments from the first request until none is still reserved.
-Latency runs from sending a request to reading its response, so for payments it ends at acceptance. Every run:
-reconciliation clean, money conserved, all 5,000 payments captured (none voided, expired or left active).
+credit. *HTTP latency* runs from sending a request to reading its response; for a transfer that is when it's
+done, for a payment only when it's accepted. *Completed end to end* counts captured payments from the first request
+until none is still reserved (polled every 50 ms). How long each payment waited from acceptance to its own
+settlement wasn't recorded, so there is no per-payment completion p50 or p99; the drain column is the only
+completion-side tail figure. Every run: reconciliation clean, money conserved, all 5,000 payments captured (none
+voided, expired or left active). Limits: one machine, the load generator sharing it with the server, the server on
+Python 3.13 while the image runs 3.14, two runs per setting.
 
 **The settlement delay is the maintenance interval.** With the default `TALLY_MAINTENANCE_INTERVAL=5`, the batched
 row accepts 2,491 – 2,623 /s (fewer settlement batches compete while payments arrive) but completes only 1,106 –
@@ -291,7 +302,9 @@ creating it locks only the payer's row (the money is reserved, so it can't be sp
 worker turns up to 100 pending payments into one transaction that debits every payer and credits the merchant
 once. That's how card payments work: authorize now, clear in batches. The merchant's lock is taken once per batch
 instead of once per payment, so the batched hotspot accepts payments nearly as fast as spread traffic
-(1,944 – 2,118/s against 2,160/s) with a p99 of 0.16 – 0.21 s instead of the transfer hotspot's 1.6 s.
+(1,944 – 2,118/s against 2,160/s), and the HTTP p99 drops from the transfer hotspot's 1.6 s to 0.16 – 0.21 s. That
+compares acceptance with completion: the merchant is credited later, and all of a run's payments were credited
+0.6 – 0.7 s after the last acceptance (1 s interval).
 The cost is consistency on that one account: the merchant's balance trails by up to one settlement interval, while
 the payer's side is immediate. Two details made it work:
 
@@ -425,6 +438,10 @@ docker compose run --rm admin tally demo     # sample data, and prints the demo 
 open http://localhost:8000                   # the console (paste the key); API docs at /docs
 ```
 
+**Upgrading a ledger created before migration 010** needs the old version stopped first: it can't serve the new
+schema. The steps, the checks afterwards, rollback limits and how to review payments the old version let expire are
+in [`docs/UPGRADING.md`](docs/UPGRADING.md).
+
 Admin commands (`demo`, `create-client`, `create-key`, `revoke-key`, `list-keys`, `migrate`) run in the `admin`
 service, as the schema owner; the API itself can't create clients or keys (see [Database roles](#database-roles)).
 A data volume created before the roles were split doesn't have the API's login role yet; create it once with
@@ -478,20 +495,35 @@ connect as the owner (migration 012):
   service, which migrates and exits before the API starts.
 - **The API** connects as a login role that is a member of `tally_app` and nothing else (`tally_api` in Compose,
   created by [`docker/postgres-init/10-runtime-role.sh`](docker/postgres-init/10-runtime-role.sh) with the
-  password from `TALLY_APP_DB_PASSWORD`). It isn't a superuser and owns nothing, so it can't alter tables,
-  disable triggers, switch on replica mode or become the owner. It gets exactly the privileges the code uses,
-  column by column for updates: it can insert entries but not delete them, change a hold's status but not its
-  amount or expiry, and read keys but not create or revoke them. Audit rows and events are written by
-  `SECURITY DEFINER` trigger functions, so the API can neither forge nor delete them; expired events are removed
-  only through `purge_outbox_events()`, which never touches anything younger than 7 days.
+  password from `TALLY_APP_DB_PASSWORD`). It gets exactly the privileges the code uses, column by column for
+  updates.
 - At startup the API checks that no migration is pending (it can read `schema_migrations` but not apply anything)
   and refuses to start, telling you to run `tally migrate` as the owner, if one is.
 
-The owner, and any superuser, remain inside the trust boundary: they can still do everything listed above, and
-so can anyone holding their credentials. What this buys is that a bug or an attacker in the API process can't.
-The API's role can also still do everything the API legitimately does, across all clients (it is the
-multi-tenant service), and can set the session values the audit trigger records as the acting key.
-`test_runtime_role.py` connects as such a role and checks both sides.
+What that role, and therefore a bug or an attacker in the API process, **can't** do, because the database refuses
+it (`test_runtime_role.py` tries each):
+
+- Switch rules off: it owns nothing and isn't a superuser, so no `ALTER TABLE`, `DISABLE TRIGGER`, dropped
+  constraint, replica mode, or `SET ROLE` to the owner.
+- Rewrite history: `UPDATE`, `DELETE` and `TRUNCATE` on entries and transactions are refused, entries only in the database
+  transaction that created their transaction (sealing, migration 011), a hold's amount, account, destination and
+  expiry fixed, settled holds final.
+- Touch the audit trail or event feed directly: no `INSERT`, `UPDATE`, `DELETE` or even `SELECT` on `audit_log`;
+  audit rows and events are written only by `SECURITY DEFINER` trigger functions as a side effect of a real
+  change, and events are removed only through `purge_outbox_events()`, never anything younger than 7 days.
+- Manage access: create clients or keys, revoke or un-revoke keys, or change the migration history.
+
+What **still depends on the application**, because that role can do anything the API legitimately does:
+
+- **Tenant isolation.** The role reads and writes every client's books; which client a request sees is decided
+  by the ledger's filters. The database only guarantees that books don't mix (composite foreign keys).
+- **Who the audit log names.** The key and request id in an audit row come from session settings the API sets
+  (`set_config`), and the role can set them to any value. The database guarantees the row exists and can't be
+  changed, not that its actor is true.
+- **Legitimate-looking money movements.** It can post any balanced transaction the API could post, for any client.
+
+The owner, and any superuser, remain inside the trust boundary: they can do everything above, including switching
+the rules off, and so can anyone holding their credentials.
 
 ### Connection handling
 
@@ -512,6 +544,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 pytest -q --cov  # plus statement and branch coverage; fails under 90% combined (CI runs this)
 coverage json -o coverage.json   # after --cov: totals.covered_lines/num_statements, covered_branches/num_branches
 pytest tests/test_invariants.py --hypothesis-profile=thorough   # 500 random sequences instead of 100
+python scripts/upgrade_acceptance.py --admin-url postgresql://...   # old code builds a ledger at 009, this upgrades it
 python scripts/mutation_check.py tests/mutants/capture_releases_after_spending.patch \
     tests/test_holds.py::test_a_capture_at_the_funds_boundary_succeeds tests/test_invariants.py
 node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (Node 22+, no npm install)
@@ -519,7 +552,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-297 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for
+304 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for
 the console's JavaScript; warnings fail the run. The API's tests, `books` and the maintenance tests connect as the
 runtime role, not the owner. Coverage, measured on 2026-10-31 with `pytest -q --cov` and `coverage json` from a
 clean `requirements-dev.txt` install (same figures on Python 3.14 and 3.11):
@@ -535,14 +568,14 @@ was 96.8% combined, with branches at 91.8% (178 of 194) and statements at 97.7%.
 |---|---|
 | `test_transactions.py` (24) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks, single-entry posts, 404s for unknown transactions and holds |
 | `test_holds.py` (18) | Authorize, partial capture, void, expiry in bounded batches, capture on debit-normal accounts, double settlement, capturing the last of the funds and every capture at the funds boundary, capturing into the held account, expiry and amount validation |
-| `test_database_invariants.py` (39) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected; a transaction touching another client's account, a forged entry client, an account changing owner, an editable audit log, entries appended to committed, reversed or reversing transactions, a forged `created_xid` |
+| `test_database_invariants.py` (43) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected; a transaction touching another client's account, a forged entry client, an account changing owner, an editable audit log, entries appended to committed, reversed or reversing transactions, a forged `created_xid`, a `void_reason` on a hold that wasn't voided |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals. Each race gets its own pool, filled first, so all 60 transactions really run at once, and fails if any transaction was retried, so a deadlock can't hide behind `db.run`'s retries |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (22) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers; error codes that don't depend on the Python version |
 | `test_tenancy.py` (13) | Missing, malformed, unknown and revoked keys get `401`; key rotation; only a hash stored; another client's accounts, transactions and holds are `404` for every read and write and no money moves; idempotency keys per client; reconciliation per client; audit rows naming key and request, none for replays or failures, keyless rows for changes made around the API |
 | `test_events.py` (9) | One event per change with the transaction's entries; every kind of change; nothing for a rollback or a commit-time failure; per client; paging resumes exactly; an older transaction committing later is never skipped; batched purge; forged cursors |
 | `test_settlement.py` (11) | A payment reserves on the payer and pays the merchant at settlement, one transaction per batch; bounded batches; paying never waits on the merchant's row lock (a transfer does); destination validation; voided payments skipped; two settlers at once settle each payment once; a payment written around the API can't stall settlement; the destination can't change |
-| `test_payment_lifecycle.py` (22) | Over HTTP with two clients: which destinations a payment may have (9 account-type pairings, refused ones leave no trace); a legacy invalid payment voided alone while another client's settles; a group refused at posting undone by its savepoint and voided while the next settles; connection errors, bugs and unknown errors voiding nothing; repeated maintenance changing nothing; payments refusing an expiry, outliving late and paused maintenance (the review's 1 s reproduction), and settled exactly once while expiry races settlement; manual capture of a payment refused for its own, another or no destination |
+| `test_payment_lifecycle.py` (25) | Over HTTP with two clients: which destinations a payment may have (9 account-type pairings, refused ones leave no trace); a legacy invalid payment voided alone while another client's settles; a group refused at posting undone by its savepoint and voided while the next settles; connection errors, bugs and unknown errors voiding nothing; repeated maintenance changing nothing; payments refusing an expiry, outliving late and paused maintenance (the review's 1 s reproduction), and settled exactly once while expiry races settlement; an owner's void racing settlement (each interleaving forced with real row locks, then 100 payments voided while a settler runs): one final state per payment, the void's answer matching it, money credited and reservations released once; manual capture of a payment refused for its own, another or no destination |
 | `test_runtime_role.py` (36) | The API's role is no superuser and owns nothing; 29 escalation attempts refused (disabling triggers, replica mode, `SET ROLE`, editing history, the audit log, events, keys and migration history); columns granted only for locking still can't be written; the API starts as that role and refuses pending migrations; it purges only expired events |
 | `test_cli.py` (21) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C; API keys: only the key on stdout, revoke and list, unknown clients and keys, taken names |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
@@ -607,8 +640,10 @@ src/tally/
 scripts/load_test.py        concurrent load test: answers, settlement, reconciliation, conservation; --json keeps raw numbers
 scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries (refuses non-bench databases)
 scripts/mutation_check.py   applies a mutant to a temporary copy and checks the tests catch it
+scripts/upgrade_acceptance.py  upgrades a ledger the old code built (009) to the latest and checks it (docs/UPGRADING.md)
 scripts/lock-dev.sh         regenerates requirements-dev.txt in a clean container
 perf/results/               raw load test output, with the commands and environment
+docs/UPGRADING.md           upgrading a running ledger to 010-012: steps, checks, rollback, expired payments
 tests/mutants/              planted bugs the tests must catch
 docker/postgres-init/       creates the API's login role when the Compose database is first created
 requirements.txt            exact runtime versions for the image and CI (Dependabot keeps them current)

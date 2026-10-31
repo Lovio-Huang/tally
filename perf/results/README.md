@@ -39,25 +39,29 @@ python3 scripts/load_test.py --base-url http://127.0.0.1:8012 --wallets 200 --re
 **Results.** Every run: every request answered `201`, reconciliation clean, money conserved, and all 5,000
 payments captured (none voided, expired or left active).
 
-| Interval | Scenario | Accepted /s | p50 | p99 | Lock wait (mean) | Completed end to end | Last payment settled |
+| Interval | Scenario | Accepted /s | HTTP latency p50 / p99 | Lock wait (mean) | Completed end to end | Each payment's completion latency | Drain: last settled after last accepted |
 |---|---|---|---|---|---|---|---|
-| 1 s | spread | 2,160 – 2,167 | 42 ms | 118 – 120 ms | 11 – 13 ms | same as accepted | |
-| 1 s | hotspot | 565 – 572 | 42 – 48 ms | 1.56 – 1.62 s | 136 – 137 ms | same as accepted | |
-| 1 s | hotspot, batched | 1,944 – 2,118 | 35 – 38 ms | 159 – 215 ms | 16 – 20 ms | 1,576 – 1,628 /s (3.07 – 3.17 s) | 0.60 – 0.71 s after the last was accepted |
-| 5 s | spread | 2,201 – 2,284 | 38 – 43 ms | 120 – 127 ms | 9 – 14 ms | same as accepted | |
-| 5 s | hotspot | 568 – 576 | 37 – 41 ms | 1.85 – 1.86 s | 135 – 137 ms | same as accepted | |
-| 5 s | hotspot, batched | 2,491 – 2,623 | 37 – 39 ms | 72 – 74 ms | 4 ms | 1,106 – 1,266 /s (3.95 – 4.52 s) | 2.04 – 2.51 s after the last was accepted |
+| 1 s | spread | 2,160 – 2,167 | 42 ms / 118 – 120 ms | 11 – 13 ms | = accepted | = HTTP latency | n/a |
+| 1 s | hotspot | 565 – 572 | 42 – 48 ms / 1.56 – 1.62 s | 136 – 137 ms | = accepted | = HTTP latency | n/a |
+| 1 s | hotspot, batched | 1,944 – 2,118 | 35 – 38 ms / 159 – 215 ms (acceptance only) | 16 – 20 ms | 1,576 – 1,628 /s (3.07 – 3.17 s) | not measured | 0.60 – 0.71 s |
+| 5 s | spread | 2,201 – 2,284 | 38 – 43 ms / 120 – 127 ms | 9 – 14 ms | = accepted | = HTTP latency | n/a |
+| 5 s | hotspot | 568 – 576 | 37 – 41 ms / 1.85 – 1.86 s | 135 – 137 ms | = accepted | = HTTP latency | n/a |
+| 5 s | hotspot, batched | 2,491 – 2,623 | 37 – 39 ms / 72 – 74 ms (acceptance only) | 4 ms | 1,106 – 1,266 /s (3.95 – 4.52 s) | not measured | 2.04 – 2.51 s |
 
 How to read it (definitions in the script's docstring):
 
 - **Accepted /s** is `201` answers per second of the scenario's wall time. For a transfer that is a finished
   transfer. For a payment it is only the reservation on the payer; the merchant is credited later.
-- **Latency** is per request, on the client: from just before the request is sent until its response has been
-  read. For payments it ends at acceptance, not settlement.
+- **HTTP latency** is per request, on the client: from just before the request is sent until its response has been
+  read. For transfers that is completion; for payments it ends at acceptance, not settlement. The script doesn't
+  record when each payment settled, so per-payment completion latency (and its percentiles) is not measured.
+- **Drain** is how long after the last payment was accepted the last one was settled: the completion-side tail.
 - **Completed end to end** (batched only) counts captured payments per second from the first request sent until
   the moment no payment was still reserved, which the script polls every 50 ms.
 - **Lock wait** is the server's mean time to acquire account row locks, from `/metrics`: one observation per
   locking statement, so settlement batches are included in the batched row.
+- Limits: one machine; the load generator shares it with the server; the server ran Python 3.13, the image runs
+  3.14; two runs per setting.
 - The settlement delay depends on the interval: a payment waits for the next maintenance tick, so with the default
   5 s interval the last one settles anywhere up to about 5 s after it was accepted. The 0.6–0.7 s figure needs
   `TALLY_MAINTENANCE_INTERVAL=1`. With the default, fewer settlement batches run during the acceptance window,

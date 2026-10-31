@@ -13,8 +13,10 @@
 -- The login role and its password are created outside migrations, because credentials
 -- don't belong in version control (README, "Database roles").
 --
--- The owner, and any superuser, stay inside the trust boundary: they can still do all
--- of the above.
+-- Still up to the API, not the database: which client's rows a request sees (this role
+-- reads and writes every client's books), and which key an audit row names (it comes
+-- from session settings the API sets). The owner, and any superuser, stay inside the
+-- trust boundary: they can still do all of the above.
 
 DO $$
 BEGIN
