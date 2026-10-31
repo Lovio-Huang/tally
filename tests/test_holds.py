@@ -137,6 +137,28 @@ def test_capturing_a_hold_on_the_last_of_the_funds_works(books, wallet):
 
 
 @pytest.mark.parametrize(
+    ("hold", "other_hold", "capture"),
+    [(400, 0, 400), (400, 0, 1), (399, 0, 399), (300, 100, 300), (300, 100, 150)],
+    ids=["all-of-it", "one-unit-of-it", "one-unit-spare", "rest-held-elsewhere", "partial-rest-held-elsewhere"],
+)
+def test_a_capture_at_the_funds_boundary_succeeds(books, wallet, hold, other_hold, capture):
+    # Nothing is available before the capture (or one unit). The capture must release this
+    # hold's whole reservation before its debit lands; released afterwards, the debit would
+    # briefly overdraw the account and the database refuses it. Kept as a mutant:
+    # python scripts/mutation_check.py tests/mutants/capture_releases_after_spending.patch ...
+    alice, store = wallet("alice", funded=400), wallet("store")
+    held = books.create_hold(alice["id"], hold, datetime.now(UTC) + LATER)
+    if other_hold:
+        books.create_hold(alice["id"], other_hold, datetime.now(UTC) + LATER)
+
+    books.capture_hold(held["id"], store["id"], capture)
+
+    a = account(books, alice)
+    assert (a["balance"], a["held"], a["available"]) == (400 - capture, other_hold, 400 - capture - other_hold)
+    assert account(books, store)["balance"] == capture
+
+
+@pytest.mark.parametrize(
     "expires_at",
     [datetime.now() + LATER, datetime.now(UTC) - timedelta(seconds=1)],
     ids=["naive", "in-the-past"],

@@ -9,7 +9,7 @@ import secrets
 
 import psycopg
 import pytest
-from hypothesis import settings
+from hypothesis import Phase, settings
 from psycopg import sql
 
 from tally import auth
@@ -19,11 +19,14 @@ from tally.ledger import Ledger
 TABLES = "api_clients, api_keys, audit_log, outbox_events, accounts, transactions, entries, holds, idempotency_keys"
 DEFAULT_CLIENT = 1  # created by migration 006, and again by reset()
 
-# Pull requests run 40 random operation sequences; `pytest --hypothesis-profile=thorough`
+# Pull requests run 100 random operation sequences; `pytest --hypothesis-profile=thorough`
 # runs 500. print_blob makes a failure in CI print a @reproduce_failure line that
 # replays the exact sequence locally.
-settings.register_profile("ci", max_examples=40, print_blob=True)
+settings.register_profile("ci", max_examples=100, print_blob=True)
 settings.register_profile("thorough", max_examples=500, print_blob=True)
+# scripts/mutation_check.py only needs to know that some sequence fails, not the shortest one:
+# shrinking a 40-step sequence against the database takes minutes.
+settings.register_profile("mutation", max_examples=300, phases=[Phase.explicit, Phase.reuse, Phase.generate])
 settings.load_profile("ci")
 
 
