@@ -100,15 +100,24 @@ class ReversalIn(BaseModel):
     description: Description = ""
 
 
+DEFAULT_HOLD_SECONDS = 7 * 24 * 3600
+
+
 class HoldIn(BaseModel):
     account_id: AccountId
     amount: Amount
-    expires_in_seconds: Annotated[int, Field(ge=1, le=30 * 24 * 3600)] = 7 * 24 * 3600
+    expires_in_seconds: Annotated[int, Field(ge=1, le=30 * 24 * 3600)] | None = Field(
+        None,
+        description=f"Ordinary holds only (default {DEFAULT_HOLD_SECONDS}, 7 days). A payment has no expiry: "
+        "sending this with settle_to_account_id is a 422 PAYMENTS_DO_NOT_EXPIRE",
+    )
     description: Description = ""
     settle_to_account_id: AccountId | None = Field(
         None,
         description="Makes the hold a payment to this account, settled with others in the next batch: "
-        "for paying hot accounts (merchants) without queueing on their row lock",
+        "for paying hot accounts (merchants) without queueing on their row lock. A payment waits for "
+        "settlement however long it takes and ends captured, or voided (by its owner, or by settlement "
+        "with void_reason); it can't be captured by hand (409 PAYMENT_SETTLES_AUTOMATICALLY)",
     )
 
 
@@ -124,9 +133,10 @@ class HoldOut(BaseModel):
     amount: int
     status: Literal["active", "captured", "voided", "expired"]
     description: str
-    expires_at: datetime
+    expires_at: datetime | None = Field(description="None for payments: they don't expire")
     captured_transaction_id: UUID | None
     settle_to_account_id: int | None
+    void_reason: str | None = Field(description="Why settlement voided a payment; None otherwise")
     created_at: datetime
     updated_at: datetime
 

@@ -39,6 +39,9 @@ DB_RETRIES = Counter(
 )
 PROBLEMS = Counter("tally_problems_total", "Error responses, by problem code", ["code"])
 SETTLED = Counter("tally_settled_payments_total", "Payments (holds with a destination) settled in batches")
+VOIDED = Counter(
+    "tally_settlement_voided_payments_total", "Payments settlement refused and voided (see holds.void_reason)"
+)
 
 # A caller-supplied ID ends up in logs and headers, so only plain tokens are accepted.
 REQUEST_ID_FORMAT = re.compile(r"[A-Za-z0-9._-]{1,64}")

@@ -3,7 +3,7 @@
 import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import psycopg
 import pytest
@@ -28,7 +28,7 @@ def shop(books, wallet):
 
 
 def pay(books, customer, merchant, amount):
-    return books.create_hold(customer["id"], amount, datetime.now(UTC) + LATER, "coffee", merchant["id"])
+    return books.create_hold(customer["id"], amount, None, "coffee", merchant["id"])
 
 
 def account(books, a) -> dict:
@@ -91,9 +91,7 @@ def test_paying_never_waits_on_the_merchants_row(migrated, db, shop):
 
         with pytest.raises(psycopg.errors.LockNotAvailable):
             attempt(lambda conn: impatient.transfer(conn, alice["id"], merchant["id"], 10))
-        hold = attempt(
-            lambda conn: impatient.create_hold(conn, alice["id"], 10, datetime.now(UTC) + LATER, "", merchant["id"])
-        )
+        hold = attempt(lambda conn: impatient.create_hold(conn, alice["id"], 10, None, "", merchant["id"]))
 
     assert hold["status"] == "active"
 
@@ -111,25 +109,20 @@ def test_a_payment_needs_a_valid_destination(books, shop, destination, code):
     }[destination]
 
     with pytest.raises(LedgerError) as error:
-        books.create_hold(alice["id"], 10, datetime.now(UTC) + LATER, "", target)
+        books.create_hold(alice["id"], 10, None, "", target)
 
     assert error.value.code == code
 
 
-def test_voided_and_expired_payments_are_not_settled(db, books, shop):
-    merchant, (alice, bob, carol) = shop["merchant"], shop["customers"]
-    voided, expired = pay(books, alice, merchant, 10), pay(books, bob, merchant, 20)
-    pay(books, carol, merchant, 30)
+def test_a_voided_payment_is_not_settled(db, books, shop):
+    merchant, (alice, bob, _) = shop["merchant"], shop["customers"]
+    voided = pay(books, alice, merchant, 10)
+    pay(books, bob, merchant, 30)
     books.void_hold(voided["id"])
-    db.run(
-        lambda conn: conn.execute(
-            "UPDATE holds SET expires_at = now() - interval '1 second' WHERE id = %s", (expired["id"],)
-        )
-    )
 
     assert settle(db) == 1
     assert account(books, merchant)["balance"] == 30
-    assert books.expire_holds() == 1 and account(books, bob)["available"] == 1_000
+    assert account(books, alice)["available"] == 1_000
 
 
 def test_two_settlers_at_once_settle_each_payment_exactly_once(db, books, shop):
@@ -155,19 +148,21 @@ def test_a_payment_that_slipped_past_validation_cannot_stall_settlement(migrated
     merchant, bob = shop["merchant"], shop["customers"][1]
     euros = books.create_account("Euro wallet", "liability", "EUR", allow_negative=True)
     with psycopg.connect(migrated) as raw:  # around the API's currency check
-        raw.execute(
-            "INSERT INTO holds (account_id, amount, expires_at, settle_to_account_id) "
-            "VALUES (%s, 5, now() + interval '1 day', %s)",
+        legacy = raw.execute(
+            "INSERT INTO holds (account_id, amount, settle_to_account_id) VALUES (%s, 5, %s) RETURNING id",
             (euros["id"], merchant["id"]),
-        )
+        ).fetchone()[0]
     good = pay(books, bob, merchant, 40)
 
-    with caplog.at_level(logging.ERROR, logger="tally.ledger"):
+    with caplog.at_level(logging.WARNING, logger="tally.ledger"):
         settle(db)
 
     assert books.get_hold(good["id"])["status"] == "captured"
     assert account(books, merchant)["balance"] == 40
-    assert any("voiding 1 payment" in r.getMessage() for r in caplog.records)
+    refused = books.get_hold(legacy)
+    assert refused["status"] == "voided" and refused["void_reason"].startswith("settlement refused: CURRENCY_MISMATCH")
+    assert account(books, euros)["held"] == 0
+    assert any("voided 1 payment" in r.getMessage() for r in caplog.records)
     assert settle(db) == 0  # nothing left to trip over
 
 

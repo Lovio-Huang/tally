@@ -36,8 +36,8 @@ import psycopg
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from .errors import conflict, not_found, unprocessable
-from .observability import LOCK_WAIT_SECONDS, SETTLED
+from .errors import LedgerError, conflict, not_found, unprocessable
+from .observability import LOCK_WAIT_SECONDS, SETTLED, VOIDED
 
 Direction = Literal["debit", "credit"]
 AccountType = Literal["asset", "liability", "equity", "revenue", "expense"]
@@ -57,7 +57,7 @@ log = logging.getLogger(__name__)
 
 HOLD_COLUMNS = (
     "id, account_id, amount, status, description, expires_at, captured_transaction_id, settle_to_account_id, "
-    "created_at, updated_at"
+    "void_reason, created_at, updated_at"
 )
 
 
@@ -84,6 +84,27 @@ class Leg:
 
 def opposite(direction: str) -> Direction:
     return "credit" if direction == "debit" else "debit"
+
+
+def payment_problem(payer: dict[str, Any], destination: dict[str, Any]) -> tuple[str, str] | None:
+    """Why a payment from ``payer`` to ``destination`` can't be settled, as (code, message), or None.
+
+    Settlement moves the payer away from its normal side and the destination by the same
+    amount in the opposite direction, which is the payer's normal side. Paying a wallet
+    (credit-normal) into a merchant liability credits the merchant: its balance grows.
+    Paying it into an asset account would also credit it, but an asset grows with debits,
+    so its balance would shrink; unless that account may go negative, settlement would
+    overdraw it. The rule follows from normal sides, not from a list of account types.
+    """
+    if destination["currency"] != payer["currency"]:
+        return "CURRENCY_MISMATCH", f"Cannot pay a {destination['currency']} account from a {payer['currency']} one"
+    if destination["normal_side"] != payer["normal_side"] and not destination["allow_negative"]:
+        return (
+            "INVALID_DESTINATION",
+            f"Paying account {destination['id']} from account {payer['id']} would reduce its balance "
+            f"({destination['type']} accounts grow with {destination['normal_side']}s) and it may not go negative",
+        )
+    return None
 
 
 class Ledger:
@@ -186,33 +207,40 @@ class Ledger:
         conn: Connection,
         account_id: int,
         amount: int,
-        expires_at: datetime,
+        expires_at: datetime | None,
         description: str = "",
         settle_to: int | None = None,
     ) -> dict:
-        """Reserves funds for a later capture: they stay in the balance but are no longer available.
+        """Reserves funds: they stay in the balance but are no longer available.
 
-        With ``settle_to`` the hold is a payment to that account, captured by the next
-        settlement batch (``settle_holds``) instead of by a client. Only the payer's row is
-        locked: the destination is read without a lock (its currency and owner can't
-        change), which is the whole point when thousands of payers share one destination.
+        An ordinary hold (``settle_to`` None) is a card-style authorization: a client
+        captures or voids it, and if nobody does, it expires at ``expires_at``.
+
+        With ``settle_to`` the hold is a payment to that account. It has no expiry: once
+        accepted it waits for the next settlement batch (``settle_holds``), however long
+        that takes, and only settlement captures it. Only the payer's row is locked; the
+        destination is read without a lock (its type, currency and owner can't change),
+        which is the whole point when thousands of payers share one destination.
         """
         require_positive_amount(amount)
-        # A naive datetime would be read in the database session's time zone, which can
-        # shift the expiry by hours without any error.
-        if expires_at.tzinfo is None:
-            raise unprocessable("INVALID_EXPIRY", "expires_at must include a time zone")
-        if expires_at <= datetime.now(UTC):
-            raise unprocessable("INVALID_EXPIRY", f"expires_at must be in the future, got {expires_at.isoformat()}")
-        if settle_to is not None:
+        if settle_to is None:
+            # A naive datetime would be read in the database session's time zone, which can
+            # shift the expiry by hours without any error.
+            if expires_at is None or expires_at.tzinfo is None:
+                raise unprocessable("INVALID_EXPIRY", "An ordinary hold needs expires_at, with a time zone")
+            if expires_at <= datetime.now(UTC):
+                raise unprocessable("INVALID_EXPIRY", f"expires_at must be in the future, got {expires_at.isoformat()}")
+        else:
+            if expires_at is not None:
+                raise unprocessable(
+                    "PAYMENTS_DO_NOT_EXPIRE", "A payment waits for settlement however long it takes; it has no expiry"
+                )
             if settle_to == account_id:
                 raise unprocessable("SAME_ACCOUNT", "A payment's destination must differ from the paying account")
             destination = self.get_account(conn, settle_to)  # no lock: see above
         account = self._lock_accounts(conn, {account_id})[account_id]
-        if settle_to is not None and destination["currency"] != account["currency"]:
-            raise unprocessable(
-                "CURRENCY_MISMATCH", f"Cannot pay a {destination['currency']} account from a {account['currency']} one"
-            )
+        if settle_to is not None and (problem := payment_problem(account, destination)):
+            raise unprocessable(*problem)
         if not account["allow_negative"] and account["available"] < amount:
             raise conflict(
                 "INSUFFICIENT_FUNDS", f"Account {account_id} has {account['available']} available, hold needs {amount}"
@@ -232,8 +260,15 @@ class Ledger:
         amount: int | None = None,
         description: str = "",
     ) -> dict:
-        """Turns a hold into a real transaction. Any uncaptured remainder is released."""
+        """Turns an ordinary hold into a real transaction. Any uncaptured remainder is released."""
         hold = self._lock_active_hold(conn, hold_id)
+        if hold["settle_to_account_id"] is not None:
+            # A payment's destination was fixed when it was accepted; capturing it by hand
+            # could send the money elsewhere, or settle it twice.
+            raise conflict(
+                "PAYMENT_SETTLES_AUTOMATICALLY",
+                f"Hold {hold_id} is a payment to account {hold['settle_to_account_id']}: settlement captures it",
+            )
         amount = hold["amount"] if amount is None else amount
         require_positive_amount(amount, "capture amount")
         if amount > hold["amount"]:
@@ -263,6 +298,7 @@ class Ledger:
         return {"hold": captured, "transaction": transaction}
 
     def void_hold(self, conn: Connection, hold_id: UUID) -> dict:
+        """Releases a hold. A payment can be voided too, until settlement has captured it."""
         self._lock_active_hold(conn, hold_id)
         # The database gives the amount back to the account's available funds.
         return conn.execute(
@@ -270,10 +306,11 @@ class Ledger:
         ).fetchone()
 
     def expire_holds(self, conn: Connection, limit: int = EXPIRY_BATCH_SIZE) -> int:
-        """Releases holds whose expiry has passed. Safe to run on several instances at once."""
+        """Releases ordinary holds whose expiry has passed. Payments never expire; settlement ends them."""
         # SKIP LOCKED: holds that a capture or another instance is working on are left alone.
         expired = conn.execute(
-            "SELECT id, account_id FROM holds WHERE status = 'active' AND expires_at <= now() "
+            "SELECT id, account_id FROM holds "
+            "WHERE status = 'active' AND settle_to_account_id IS NULL AND expires_at <= now() "
             "ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED",
             (limit,),
         ).fetchall()
@@ -286,15 +323,24 @@ class Ledger:
         return len(expired)
 
     def settle_holds(self, conn: Connection, limit: int = SETTLE_BATCH_SIZE) -> int:
-        """Settles one batch of pending payments; returns how many. Safe on several instances at once.
+        """Settles one batch of the oldest pending payments; returns how many it took off the queue.
 
         Each destination gets one transaction per batch: a debit from every payer, then one
-        credit for the total. So the destination's row is locked once per batch instead of
+        credit for the total, so the destination's row is locked once per batch instead of
         once per payment. Global, like expiry: each transaction belongs to its holds' client.
+
+        One client's bad payment must not hold up everyone else's. A payment that can't be
+        settled under the ledger's rules (see ``payment_problem``) is voided on its own,
+        and each destination's transaction is posted under a savepoint: if posting it
+        breaks a ledger rule (a ``LedgerError``), only that group is undone and voided,
+        with the reason recorded in ``void_reason``; the others are still settled. Any other
+        error (a lost connection, a database failure, a bug) is not a verdict on the
+        payments: it propagates, the whole batch rolls back, and the payments stay active
+        for the next run.
         """
         holds = conn.execute(
             f"SELECT {HOLD_COLUMNS}, client_id FROM holds "
-            "WHERE status = 'active' AND settle_to_account_id IS NOT NULL AND expires_at > now() "
+            "WHERE status = 'active' AND settle_to_account_id IS NOT NULL "
             "ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED",
             (limit,),
         ).fetchall()
@@ -306,45 +352,56 @@ class Ledger:
 
         by_destination: dict[tuple[int, int], list[dict]] = defaultdict(list)
         for hold in holds:
-            by_destination[(hold["client_id"], hold["settle_to_account_id"])].append(hold)
-        for (client_id, destination), batch in by_destination.items():
-            # The API refuses such payments; one written around it would fail its batch on
-            # every run and stall settlement for everyone, so it is cancelled instead.
-            mismatched = [
-                h for h in batch if accounts[h["account_id"]]["currency"] != accounts[destination]["currency"]
-            ]
-            if mismatched:
-                log.error("voiding %d payment(s) whose currency doesn't match account %d", len(mismatched), destination)
-                ids = [h["id"] for h in mismatched]
-                conn.execute("UPDATE holds SET status = 'voided' WHERE id = ANY(%s)", (ids,))
-                batch = [h for h in batch if h not in mismatched]
-                if not batch:
-                    continue
-            legs = [
-                Leg(h["account_id"], opposite(accounts[h["account_id"]]["normal_side"]), h["amount"]) for h in batch
-            ]
-            # The destination takes the other side of the payers' legs (summed before any is added).
-            totals = {d: sum(leg.amount for leg in legs if leg.direction == d) for d in ("debit", "credit")}
-            legs += [Leg(destination, opposite(d), total) for d, total in totals.items() if total]
-            # Check against the funds as they'll be once these reservations are released.
-            released = dict(accounts)
-            for hold in batch:
-                source = released[hold["account_id"]]
-                released[hold["account_id"]] = {**source, "held": source["held"] - hold["amount"]}
-            self._check_postable(released, legs)
+            # The API refuses such payments, but one may predate that check or have been
+            # written around the API. Voiding it is the only outcome that doesn't stall.
+            problem = payment_problem(accounts[hold["account_id"]], accounts[hold["settle_to_account_id"]])
+            if problem:
+                self._void_payments(conn, [hold], ": ".join(problem))
+            else:
+                by_destination[(hold["client_id"], hold["settle_to_account_id"])].append(hold)
 
-            tenant = Ledger(client_id)
-            transaction = tenant._insert_transaction(
-                conn, f"Settlement of {len(batch)} payments", {"payments": len(batch)}
-            )
-            # Capturing releases each reservation (trigger), so it happens before the entries.
-            conn.execute(
-                "UPDATE holds SET status = 'captured', captured_transaction_id = %s WHERE id = ANY(%s)",
-                (transaction["id"], [h["id"] for h in batch]),
-            )
-            tenant._insert_entries(conn, transaction, accounts, legs)
-            SETTLED.inc(len(batch))
+        for (client_id, destination), batch in by_destination.items():
+            try:
+                with conn.transaction():  # a savepoint: a refused group is undone on its own
+                    self._settle_group(conn, client_id, destination, batch, accounts)
+            except LedgerError as refused:
+                self._void_payments(conn, batch, f"{refused.code}: {refused.message}")
+            # Later groups check against balances as they are now, not as they were locked.
+            accounts.update(self._read_accounts(conn, involved))
         return len(holds)
+
+    def _settle_group(
+        self, conn: Connection, client_id: int, destination: int, batch: list[dict], accounts: dict[int, dict]
+    ) -> None:
+        legs = [Leg(h["account_id"], opposite(accounts[h["account_id"]]["normal_side"]), h["amount"]) for h in batch]
+        # The destination takes the other side of the payers' legs (summed before any is added).
+        totals = {d: sum(leg.amount for leg in legs if leg.direction == d) for d in ("debit", "credit")}
+        legs += [Leg(destination, opposite(d), total) for d, total in totals.items() if total]
+        # Check against the funds as they'll be once these reservations are released.
+        released = dict(accounts)
+        for hold in batch:
+            source = released[hold["account_id"]]
+            released[hold["account_id"]] = {**source, "held": source["held"] - hold["amount"]}
+        self._check_postable(released, legs)
+
+        tenant = Ledger(client_id)
+        transaction = tenant._insert_transaction(conn, f"Settlement of {len(batch)} payments", {"payments": len(batch)})
+        # Capturing releases each reservation (trigger), so it happens before the entries.
+        conn.execute(
+            "UPDATE holds SET status = 'captured', captured_transaction_id = %s WHERE id = ANY(%s)",
+            (transaction["id"], [h["id"] for h in batch]),
+        )
+        tenant._insert_entries(conn, transaction, accounts, legs)
+        SETTLED.inc(len(batch))
+
+    def _void_payments(self, conn: Connection, holds: list[dict], reason: str) -> None:
+        log.warning("settlement voided %d payment(s): %s", len(holds), reason)
+        # Voiding releases each reservation (trigger); the reason is kept on the hold.
+        conn.execute(
+            "UPDATE holds SET status = 'voided', void_reason = %s WHERE id = ANY(%s)",
+            (f"settlement refused: {reason}"[:500], [h["id"] for h in holds]),
+        )
+        VOIDED.inc(len(holds))
 
     def get_hold(self, conn: Connection, hold_id: UUID) -> dict:
         hold = conn.execute(
@@ -534,6 +591,11 @@ class Ledger:
         if missing:
             raise not_found("ACCOUNT_NOT_FOUND", f"Account {missing[0]} does not exist")
         return found
+
+    def _read_accounts(self, conn: Connection, account_ids: set[int]) -> dict[int, dict[str, Any]]:
+        """Current rows of accounts this transaction has already locked."""
+        rows = conn.execute(f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s)", (sorted(account_ids),))
+        return {row["id"]: row for row in rows.fetchall()}
 
     def _lock_active_hold(self, conn: Connection, hold_id: UUID) -> dict:
         hold = conn.execute(
