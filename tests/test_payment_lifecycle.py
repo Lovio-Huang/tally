@@ -66,8 +66,8 @@ class Tenant:
 
 
 @pytest.fixture
-def http(migrated):
-    app = create_app(Settings(database_url=migrated, pool_size=10), run_migrations=False, maintenance=False)
+def http(runtime_url):
+    app = create_app(Settings(database_url=runtime_url, pool_size=10), run_migrations=False, maintenance=False)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -112,8 +112,8 @@ def legacy_payment(migrated: str, payer: dict, destination: dict, amount: int) -
         )
 
 
-def settle(db) -> int:
-    return db.run(Ledger().settle_holds)
+def settle(app_db) -> int:
+    return app_db.run(Ledger().settle_holds)
 
 
 # --- P0: which destinations a payment may have -------------------------------------------
@@ -136,7 +136,7 @@ def settle(db) -> int:
     ],
 )
 def test_a_payment_may_not_shrink_a_protected_destination(
-    db, tenant, payer_type, destination_type, allow_negative, accepted
+    app_db, db, tenant, payer_type, destination_type, allow_negative, accepted
 ):
     alice = tenant("alice")
     payer = alice.funded("payer", payer_type)
@@ -147,7 +147,7 @@ def test_a_payment_may_not_shrink_a_protected_destination(
 
     if accepted:
         assert response.status_code == 201, response.text
-        settle(db)
+        settle(app_db)
         assert alice.hold(response.json()["id"])["status"] == "captured"
         assert db.run(reconcile)["ok"]
     else:
@@ -156,7 +156,9 @@ def test_a_payment_may_not_shrink_a_protected_destination(
         assert snapshot(db) == before  # no hold, no reservation, no key, no event, no audit row
 
 
-def test_a_legacy_invalid_payment_is_voided_on_its_own_and_other_clients_are_settled(db, migrated, tenant, caplog):
+def test_a_legacy_invalid_payment_is_voided_on_its_own_and_other_clients_are_settled(
+    app_db, db, migrated, tenant, caplog
+):
     alice, bob = tenant("alice"), tenant("bob")
     alice_wallet, empty_asset = alice.funded("wallet"), alice.account("empty asset", "asset")
     bad = legacy_payment(migrated, alice_wallet, empty_asset, 100)
@@ -165,7 +167,7 @@ def test_a_legacy_invalid_payment_is_voided_on_its_own_and_other_clients_are_set
     assert alice.balance(alice_wallet) == {"balance": 1_000, "held": 100}
 
     with caplog.at_level(logging.WARNING):
-        api.run_maintenance(db, Ledger())
+        api.run_maintenance(app_db, Ledger())
 
     refused = alice.hold(bad)
     assert refused["status"] == "voided"
@@ -203,11 +205,11 @@ def two_groups(tenant) -> tuple:
     return alice, shop, payers, alice_payments, bob, bob_shop, bob_payment
 
 
-def test_a_group_refused_at_posting_is_undone_and_voided_while_the_next_group_settles(db, tenant, monkeypatch):
+def test_a_group_refused_at_posting_is_undone_and_voided_while_the_next_group_settles(app_db, db, tenant, monkeypatch):
     alice, shop, payers, alice_payments, bob, bob_shop, bob_payment = two_groups(tenant)
     refuse_posting_to(monkeypatch, shop, LedgerError(409, "INSUFFICIENT_FUNDS", "shop can't take it"))
 
-    assert settle(db) == 3
+    assert settle(app_db) == 3
 
     for payment in alice_payments:
         hold = alice.hold(payment)
@@ -227,24 +229,26 @@ def test_a_group_refused_at_posting_is_undone_and_voided_while_the_next_group_se
 @pytest.mark.parametrize(
     "error", [psycopg.OperationalError("server closed the connection"), RuntimeError("a bug"), KeyError("x")]
 )
-def test_an_unexpected_error_voids_nothing_and_the_next_run_settles_everything(db, tenant, monkeypatch, caplog, error):
+def test_an_unexpected_error_voids_nothing_and_the_next_run_settles_everything(
+    app_db, db, tenant, monkeypatch, caplog, error
+):
     alice, shop, payers, alice_payments, bob, bob_shop, bob_payment = two_groups(tenant)
     before = snapshot(db)
     refuse_posting_to(monkeypatch, shop, error)
 
     with caplog.at_level(logging.ERROR, logger="tally.api"):
-        api.run_maintenance(db, Ledger())
+        api.run_maintenance(app_db, Ledger())
 
     assert [r.getMessage() for r in caplog.records] == ["maintenance task failed: settle_payments"]
     assert snapshot(db) == before  # nothing voided, nothing half-settled: the batch rolled back
     monkeypatch.undo()
-    api.run_maintenance(db, Ledger())
+    api.run_maintenance(app_db, Ledger())
     assert {alice.hold(p)["status"] for p in alice_payments} == {"captured"}
     assert bob.hold(bob_payment)["status"] == "captured"
     assert (alice.balance(shop)["balance"], bob.balance(bob_shop)["balance"]) == (60, 40)
 
 
-def test_repeated_maintenance_neither_posts_nor_releases_twice(db, migrated, tenant):
+def test_repeated_maintenance_neither_posts_nor_releases_twice(app_db, db, migrated, tenant):
     alice, bob = tenant("alice"), tenant("bob")
     alice_wallet = alice.funded("wallet")
     legacy_payment(migrated, alice_wallet, alice.account("empty asset", "asset"), 100)
@@ -254,10 +258,10 @@ def test_repeated_maintenance_neither_posts_nor_releases_twice(db, migrated, ten
         bob.pay(bob_wallet, merchant, 10)
     time.sleep(1.1)  # the card hold's expiry passes
 
-    api.run_maintenance(db, Ledger())
+    api.run_maintenance(app_db, Ledger())
     after_one = snapshot(db)
-    api.run_maintenance(db, Ledger())
-    api.run_maintenance(db, Ledger())
+    api.run_maintenance(app_db, Ledger())
+    api.run_maintenance(app_db, Ledger())
 
     assert snapshot(db) == after_one
     assert alice.hold(card.json()["id"])["status"] == "expired"
@@ -285,7 +289,7 @@ def test_a_payment_has_no_expiry_and_refuses_one(db, tenant):
     assert ordinary["expires_at"] is not None  # an ordinary hold still gets the 7-day default
 
 
-def test_a_payment_outlives_maintenance_being_late_or_paused(db, tenant):
+def test_a_payment_outlives_maintenance_being_late_or_paused(app_db, db, tenant):
     # The review's reproduction: a payment accepted with a 1 s expiry, maintenance every
     # 5 s, and the payment expired unsettled. Here maintenance is late, then paused while
     # another instance keeps expiring holds, then resumes.
@@ -294,7 +298,7 @@ def test_a_payment_outlives_maintenance_being_late_or_paused(db, tenant):
 
     def loop() -> tuple[threading.Event, threading.Thread]:
         stop = threading.Event()
-        thread = threading.Thread(target=api._maintenance_loop, args=(db, Ledger(), 0.05, stop), daemon=True)
+        thread = threading.Thread(target=api._maintenance_loop, args=(app_db, Ledger(), 0.05, stop), daemon=True)
         thread.start()
         return stop, thread
 
@@ -307,7 +311,7 @@ def test_a_payment_outlives_maintenance_being_late_or_paused(db, tenant):
     late = alice.pay(wallet, merchant, 10).json()["id"]
     card = alice.post("/v1/holds", {"account_id": wallet["id"], "amount": 5, "expires_in_seconds": 1}).json()["id"]
     time.sleep(1.2)  # maintenance is late: the card hold's expiry passes first
-    assert db.run(Ledger().expire_holds) == 1  # expiry runs before settlement: worst order
+    assert app_db.run(Ledger().expire_holds) == 1  # expiry runs before settlement: worst order
     assert alice.hold(late)["status"] == "active"
     stop, thread = loop()
     wait_until_captured(late)
@@ -317,7 +321,7 @@ def test_a_payment_outlives_maintenance_being_late_or_paused(db, tenant):
     paused = alice.pay(wallet, merchant, 20).json()["id"]
     time.sleep(1.2)
     for _ in range(3):
-        db.run(Ledger().expire_holds)  # another instance's expiry keeps running meanwhile
+        app_db.run(Ledger().expire_holds)  # another instance's expiry keeps running meanwhile
     assert alice.hold(paused)["status"] == "active"
     stop, thread = loop()  # resumed
     wait_until_captured(paused)
@@ -329,7 +333,7 @@ def test_a_payment_outlives_maintenance_being_late_or_paused(db, tenant):
     assert alice.balance(merchant)["balance"] == 30
 
 
-def test_settlement_and_expiry_racing_settle_each_payment_once_and_release_each_hold_once(db, tenant):
+def test_settlement_and_expiry_racing_settle_each_payment_once_and_release_each_hold_once(app_db, db, tenant):
     alice = tenant("alice")
     merchant = alice.account("merchant", "liability")
     payers = [alice.funded(f"payer {i}") for i in range(4)]
@@ -345,7 +349,7 @@ def test_settlement_and_expiry_racing_settle_each_payment_once_and_release_each_
     def drain(job) -> int:
         start.wait()
         done = 0
-        while n := db.run(lambda conn: job(conn, 7)):
+        while n := app_db.run(lambda conn: job(conn, 7)):
             done += n
         return done
 
@@ -373,7 +377,7 @@ def test_settlement_and_expiry_racing_settle_each_payment_once_and_release_each_
         ("omitted", 422, "VALIDATION_ERROR"),
     ],
 )
-def test_a_payment_cannot_be_captured_by_hand(db, tenant, destination, status, code):
+def test_a_payment_cannot_be_captured_by_hand(app_db, db, tenant, destination, status, code):
     alice = tenant("alice")
     wallet, merchant, other = (
         alice.funded("wallet"),
@@ -388,7 +392,7 @@ def test_a_payment_cannot_be_captured_by_hand(db, tenant, destination, status, c
 
     assert (response.status_code, response.json()["code"]) == (status, code)
     assert snapshot(db) == before
-    settle(db)  # and settlement still pays the original destination, once
+    settle(app_db)  # and settlement still pays the original destination, once
     assert alice.hold(payment["id"])["status"] == "captured"
     assert (alice.balance(merchant)["balance"], alice.balance(other)["balance"]) == (30, 0)
 

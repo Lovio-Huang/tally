@@ -50,11 +50,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: A password for the API's database role, random per run and masked in logs
+        run: |
+          password=$(openssl rand -hex 16)
+          echo "::add-mask::$password"
+          echo "TALLY_APP_DB_PASSWORD=$password" >> "$GITHUB_ENV"
       - name: Start the stack and wait until the app's health check passes
         run: docker compose up -d --build --wait
       - name: Concurrent transfers (fails on any 5xx, timeout or unbalanced books)
         run: |
-          export TALLY_API_KEY=$(docker compose exec -T app tally create-client loadtest)
+          # Creating clients is an admin command: it runs as the schema owner, not as the API's role.
+          export TALLY_API_KEY=$(docker compose run --rm -T admin tally create-client loadtest)
           python3 scripts/load_test.py --requests 2000 --concurrency 30
       - name: The books still balance, recomputed from raw entries
         run: docker compose exec -T app tally reconcile

@@ -198,12 +198,14 @@ def migrate(url: str, until: str | None = None) -> list[str]:
     with psycopg.connect(url, autocommit=True) as conn:
         _acquire_migration_lock(conn)
         try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations "
-                "(version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), checksum TEXT)"
-            )
-            # Tables created before checksums were recorded.
-            conn.execute("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT")
+            # Skipped when already in place: the API's role may read the table but not alter it.
+            if not _history_table_ready(conn):
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS schema_migrations "
+                    "(version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), checksum TEXT)"
+                )
+                # Tables created before checksums were recorded.
+                conn.execute("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT")
             recorded = dict(conn.execute("SELECT version, checksum FROM schema_migrations").fetchall())
             _verify_history(conn, files, recorded)
             for version, sql in files:
@@ -212,12 +214,25 @@ def migrate(url: str, until: str | None = None) -> list[str]:
                     applied.append(version)
                 if version == until:
                     break
+        except psycopg.errors.InsufficientPrivilege as exc:
+            raise MigrationError(
+                f"this database role can't apply migrations ({exc}); "
+                "run `tally migrate` with the schema owner's TALLY_DATABASE_URL first"
+            ) from exc
         finally:
             # If the connection broke, closing it releases the lock anyway; an error here
             # must not hide the one that actually stopped the migration.
             with contextlib.suppress(psycopg.Error):
                 conn.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK_ID,))
     return applied
+
+
+def _history_table_ready(conn: psycopg.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('schema_migrations') "
+        "AND attname = 'checksum' AND NOT attisdropped"
+    ).fetchone()
+    return row is not None
 
 
 def _verify_history(conn: psycopg.Connection, files: list[tuple[str, str]], recorded: dict) -> None:

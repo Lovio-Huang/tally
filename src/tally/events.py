@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from psycopg import Connection
 
-RETENTION_DAYS = 7  # consumers further behind than this have to resync from the API
+# Consumers more than 7 days behind have to resync from the API (purge_outbox_events, migration 012).
 PURGE_BATCH_SIZE = 5_000
 
 
@@ -36,16 +36,9 @@ def read(conn: Connection, client_id: int, after: tuple[str, int] | None, limit:
     ).fetchall()
 
 
-def purge_expired(conn: Connection, max_age_days: int = RETENTION_DAYS, batch_size: int = PURGE_BATCH_SIZE) -> int:
-    """Deletes one batch of events older than the retention period; call until it returns less than a batch."""
-    return conn.execute(
-        """
-        DELETE FROM outbox_events
-         WHERE id IN (SELECT id FROM outbox_events
-                       WHERE created_at < now() - make_interval(days => %s)
-                       ORDER BY created_at
-                       LIMIT %s
-                       FOR UPDATE SKIP LOCKED)
-        """,
-        (max_age_days, batch_size),
-    ).rowcount
+def purge_expired(conn: Connection, batch_size: int = PURGE_BATCH_SIZE) -> int:
+    """Deletes one batch of events older than the retention period; call until it returns less than a batch.
+
+    The API's database role can't delete events itself (migration 012): this function,
+    run as the owner, only ever removes those past the 7-day retention."""
+    return conn.execute("SELECT purge_outbox_events(%s) AS purged", (batch_size,)).fetchone()["purged"]

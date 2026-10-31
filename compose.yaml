@@ -1,9 +1,26 @@
+# The API connects as tally_api, a role that can run the ledger but not change the schema
+# or switch off its rules; migrations and admin commands run as the owner, tally
+# (README, "Database roles"). tally_api's password comes from TALLY_APP_DB_PASSWORD,
+# e.g. in a .env file next to this one (git-ignored):
+#   echo "TALLY_APP_DB_PASSWORD=$(openssl rand -hex 16)" > .env
 services:
   app:
     build: .
     ports:
       # Reachable from this machine only. TALLY_PORT=8001 docker compose up if 8000 is taken.
       - "127.0.0.1:${TALLY_PORT:-8000}:8000"
+    environment:
+      TALLY_DATABASE_URL: postgresql://tally_api:${TALLY_APP_DB_PASSWORD:?set TALLY_APP_DB_PASSWORD, see compose.yaml}@postgres:5432/tally
+      TALLY_MAINTENANCE_INTERVAL: ${TALLY_MAINTENANCE_INTERVAL:-5}
+    depends_on:
+      admin:
+        condition: service_completed_successfully
+
+  # Runs as the schema owner: applies migrations, then exits. Admin commands run here too:
+  #   docker compose run --rm admin tally create-client acme
+  admin:
+    build: .
+    command: ["tally", "migrate"]
     environment:
       TALLY_DATABASE_URL: postgresql://tally:tally@postgres:5432/tally
     depends_on:
@@ -16,14 +33,18 @@ services:
       POSTGRES_USER: tally
       POSTGRES_PASSWORD: tally
       POSTGRES_DB: tally
+      TALLY_APP_DB_PASSWORD: ${TALLY_APP_DB_PASSWORD:?set TALLY_APP_DB_PASSWORD, see compose.yaml}
     ports:
       # For psql from the host. Local only: anyone who could reach it would know the password.
       - "127.0.0.1:${TALLY_DB_PORT:-5432}:5432"
     volumes:
       # A named volume keeps the ledger across `docker compose down`; `down -v` deletes it.
       - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "tally"]
+      # Over TCP: during first-time setup Postgres only listens on its socket, and the
+      # admin service connecting over the network must not start before setup is done.
+      test: ["CMD", "pg_isready", "-U", "tally", "-h", "127.0.0.1"]
       interval: 3s
       retries: 20
 

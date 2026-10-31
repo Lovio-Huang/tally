@@ -5,10 +5,12 @@ postgres:17 container is started with Testcontainers.
 """
 
 import os
+import secrets
 
 import psycopg
 import pytest
 from hypothesis import settings
+from psycopg import sql
 
 from tally import auth
 from tally.db import Database, migrate
@@ -47,7 +49,36 @@ def migrated(database_url):
 
 @pytest.fixture(scope="session")
 def db(migrated):
+    """Connected as the schema owner: for setup, cleanup and hand-written SQL."""
     database = Database(migrated, min_size=2, max_size=60)
+    yield database
+    database.close()
+
+
+RUNTIME_ROLE = "tally_test_runtime"
+
+
+@pytest.fixture(scope="session")
+def runtime_url(migrated):
+    """A login role set up the way production's is (README, "Database roles"): a member of
+    tally_app and nothing else. The API under test and `books` connect as it."""
+    password = secrets.token_hex(16)
+    with psycopg.connect(migrated, autocommit=True) as conn:
+        exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (RUNTIME_ROLE,)).fetchone()
+        verb = "ALTER" if exists else "CREATE"
+        conn.execute(
+            sql.SQL("{} ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD {}").format(
+                sql.SQL(verb), sql.Identifier(RUNTIME_ROLE), sql.Literal(password)
+            )
+        )
+        conn.execute(sql.SQL("GRANT tally_app TO {}").format(sql.Identifier(RUNTIME_ROLE)))
+    return psycopg.conninfo.make_conninfo(migrated, user=RUNTIME_ROLE, password=password)
+
+
+@pytest.fixture(scope="session")
+def app_db(runtime_url):
+    """Connected as the API's runtime role."""
+    database = Database(runtime_url, min_size=2, max_size=60)
     yield database
     database.close()
 
@@ -86,8 +117,8 @@ class Books:
 
 
 @pytest.fixture
-def books(db):
-    return Books(db)
+def books(app_db):
+    return Books(app_db)
 
 
 @pytest.fixture
@@ -116,12 +147,12 @@ def api_key(db):
 
 
 @pytest.fixture
-def client(migrated, api_key):
+def client(runtime_url, api_key):
     from fastapi.testclient import TestClient
 
     from tally.api import create_app
     from tally.config import Settings
 
-    app = create_app(Settings(database_url=migrated, pool_size=10), run_migrations=False, maintenance=False)
+    app = create_app(Settings(database_url=runtime_url, pool_size=10), run_migrations=False, maintenance=False)
     with TestClient(app, headers={"Authorization": f"Bearer {api_key}"}) as test_client:
         yield test_client
